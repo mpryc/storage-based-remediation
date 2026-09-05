@@ -2442,9 +2442,9 @@ func runPreflightChecks(watchdogPath, sbrDevicePath, nodeName string, nodeID uin
 		logger.Info("All pre-flight checks passed successfully")
 		return nil
 	} else if watchdogErr == nil {
-		return fmt.Errorf("pre-flight checks failed: SBR device is not available")
+		return fmt.Errorf("pre-flight checks failed: SBR device is not available: %w", sbrErr)
 	} else if sbrErr == nil {
-		return fmt.Errorf("pre-flight checks failed: watchdog device is not available")
+		return fmt.Errorf("pre-flight checks failed: watchdog device is not available: %w", watchdogErr)
 	} else {
 		return fmt.Errorf(
 			"pre-flight checks failed: both watchdog device and SBR device are inaccessible. Watchdog error: %v, SBR error: %v",
