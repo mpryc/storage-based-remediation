@@ -924,6 +924,9 @@ func (r *StorageBasedRemediationConfigReconciler) buildFSInitJob(
 			Labels:    initLabels,
 		},
 		Spec: batchv1.JobSpec{
+			ActiveDeadlineSeconds:   ptr.To(DeviceInitJobDeadline),
+			BackoffLimit:            ptr.To(DeviceInitJobBackoffLimit),
+			TTLSecondsAfterFinished: ptr.To(DeviceInitJobTTLSeconds),
 			Template: corev1.PodTemplateSpec{
 				ObjectMeta: metav1.ObjectMeta{
 					Labels: initLabels,
@@ -968,7 +971,6 @@ func (r *StorageBasedRemediationConfigReconciler) buildFSInitJob(
 					},
 				},
 			},
-			TTLSecondsAfterFinished: func() *int32 { i := int32(3600); return &i }(),
 		},
 	}
 }

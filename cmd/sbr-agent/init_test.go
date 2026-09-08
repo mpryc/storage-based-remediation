@@ -28,6 +28,7 @@ import (
 
 	"github.com/medik8s/storage-based-remediation/internal/agent"
 	"github.com/medik8s/storage-based-remediation/internal/blockformat"
+	"github.com/medik8s/storage-based-remediation/internal/sbdprotocol"
 )
 
 func createInitTestDevice(t *testing.T, size int64) string {
@@ -326,13 +327,14 @@ func TestRunFSInit_CreatesDeviceFiles(t *testing.T) {
 	heartbeatPath := filepath.Join(mountPath, agent.SharedStorageSBRDeviceFile)
 	fencePath := heartbeatPath + agent.SharedStorageFenceDeviceSuffix
 
+	expectedSize := int64(sbdprotocol.SBD_MAX_NODES) * int64(sbdprotocol.SBD_SLOT_SIZE)
 	for _, p := range []string{heartbeatPath, fencePath} {
 		info, err := os.Stat(p)
 		if err != nil {
 			t.Fatalf("expected file %q to exist: %v", p, err)
 		}
-		if info.Size() != 0 {
-			t.Errorf("expected file %q to be empty, got %d bytes", p, info.Size())
+		if info.Size() != expectedSize {
+			t.Errorf("expected file %q to be %d bytes, got %d bytes", p, expectedSize, info.Size())
 		}
 	}
 }
@@ -348,25 +350,39 @@ func TestRunFSInit_IdempotentBothFiles(t *testing.T) {
 	heartbeatPath := filepath.Join(mountPath, agent.SharedStorageSBRDeviceFile)
 	fencePath := heartbeatPath + agent.SharedStorageFenceDeviceSuffix
 
-	// Write data to both files to verify neither is overwritten
+	// Write a marker into each file without changing its size to verify
+	// that a second init does not overwrite existing content.
+	marker := []byte("MARKER")
 	for _, p := range []string{heartbeatPath, fencePath} {
-		if err := os.WriteFile(p, []byte("existing-data"), 0664); err != nil {
-			t.Fatalf("failed to write test data to %q: %v", p, err)
+		f, err := os.OpenFile(p, os.O_WRONLY, 0)
+		if err != nil {
+			t.Fatalf("failed to open %q for writing: %v", p, err)
 		}
+		if _, err := f.WriteAt(marker, 0); err != nil {
+			f.Close()
+			t.Fatalf("failed to write marker to %q: %v", p, err)
+		}
+		f.Close()
 	}
 
-	// Second init — should not overwrite either file
+	// Second init — should not overwrite either file (already at required size)
 	if err := runFSInit(mountPath, logr.Discard()); err != nil {
 		t.Fatalf("second runFSInit failed: %v", err)
 	}
 
 	for _, p := range []string{heartbeatPath, fencePath} {
-		data, err := os.ReadFile(p)
+		f, err := os.Open(p)
 		if err != nil {
-			t.Fatalf("failed to read %q: %v", p, err)
+			t.Fatalf("failed to open %q: %v", p, err)
 		}
-		if string(data) != "existing-data" {
-			t.Errorf("file %q was overwritten: got %q", p, data)
+		buf := make([]byte, len(marker))
+		if _, err := f.ReadAt(buf, 0); err != nil {
+			f.Close()
+			t.Fatalf("failed to read marker from %q: %v", p, err)
+		}
+		f.Close()
+		if string(buf) != string(marker) {
+			t.Errorf("file %q marker was overwritten: expected %q, got %q", p, marker, buf)
 		}
 	}
 }
