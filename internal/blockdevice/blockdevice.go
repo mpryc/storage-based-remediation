@@ -67,7 +67,7 @@ type Device struct {
 	// fadvise, when non-nil, is called before each ReadAt to request eviction
 	// of the corresponding page-cache range. This is best-effort;
 	// FADV_DONTNEED does not guarantee cache invalidation.
-	// Set to unix.Fadvise by OpenBuffered; nil (no-op) for O_DIRECT devices.
+	// nil (no-op) for O_DIRECT devices; set to unix.Fadvise by ReopenDevice.
 	fadvise func(fd int, offset int64, length int64, advice int) error
 }
 
@@ -129,21 +129,6 @@ func Open(path string) (*Device, error) {
 // OpenWithLogger opens a raw block device with a logger for retry operations
 func OpenWithLogger(path string, logger logr.Logger) (*Device, error) {
 	return OpenWithTimeout(path, DefaultIOTimeout, logger)
-}
-
-// OpenBuffered opens a block device without O_DIRECT (buffered I/O).
-// When O_DIRECT is not available (e.g. Portworx), this is the only option.
-// Reads request eviction of the corresponding page-cache range before
-// accessing the device to reduce the likelihood of stale cached data.
-// Cache eviction is best-effort and does not provide a cache-coherency
-// guarantee.
-func OpenBuffered(path string, ioTimeout time.Duration, logger logr.Logger) (*Device, error) {
-	dev, err := openWithOpener(path, ioTimeout, logger, BufferedDeviceOpener)
-	if err != nil {
-		return nil, err
-	}
-	dev.fadvise = unix.Fadvise
-	return dev, nil
 }
 
 // OpenWithTimeout opens a raw block device with custom I/O timeout and logger.

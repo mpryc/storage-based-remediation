@@ -653,53 +653,18 @@ func BenchmarkWriteAt(b *testing.B) {
 	}
 }
 
-func TestOpenBuffered(t *testing.T) {
+func TestFadviseInvokedOnBufferedDevice(t *testing.T) {
 	devicePath, cleanup := setupTestDevice(t, 4096)
 	defer cleanup()
 
-	// OpenBuffered should work the same as OpenWithTimeout but use
-	// bufferedOpener (no O_DIRECT). Since unit tests already override
-	// DeviceOpener, we verify the function signature and I/O work.
-	device, err := OpenBuffered(devicePath, 5*time.Second, logr.Discard())
+	device, err := openWithOpener(devicePath, 5*time.Second, logr.Discard(), BufferedDeviceOpener)
 	if err != nil {
-		t.Fatalf("OpenBuffered failed: %v", err)
+		t.Fatalf("openWithOpener (buffered) failed: %v", err)
 	}
 	defer device.Close()
 
-	// Write and read back
-	testData := []byte("buffered test data")
-	n, err := device.WriteAt(testData, 0)
-	if err != nil {
-		t.Fatalf("WriteAt failed: %v", err)
-	}
-	if n != len(testData) {
-		t.Errorf("expected to write %d bytes, wrote %d", len(testData), n)
-	}
-
-	readBuf := make([]byte, len(testData))
-	n, err = device.ReadAt(readBuf, 0)
-	if err != nil {
-		t.Fatalf("ReadAt failed: %v", err)
-	}
-	if string(readBuf[:n]) != string(testData) {
-		t.Errorf("read data mismatch: expected %q, got %q", testData, readBuf[:n])
-	}
-}
-
-func TestOpenBufferedInvokesFadvise(t *testing.T) {
-	devicePath, cleanup := setupTestDevice(t, 4096)
-	defer cleanup()
-
-	device, err := OpenBuffered(devicePath, 5*time.Second, logr.Discard())
-	if err != nil {
-		t.Fatalf("OpenBuffered failed: %v", err)
-	}
-	defer device.Close()
-
-	// Verify OpenBuffered configured the production fadvise
-	if device.fadvise == nil {
-		t.Fatal("expected fadvise to be configured for OpenBuffered device")
-	}
+	// Manually set fadvise as ReopenDevice does in production
+	device.fadvise = unix.Fadvise
 
 	// Inject a recording fadvise to verify ReadAt calls it
 	var calls []fadviseCall
@@ -774,9 +739,9 @@ func TestFadviseContinuesOnError(t *testing.T) {
 	devicePath, cleanup := setupTestDevice(t, 4096)
 	defer cleanup()
 
-	device, err := OpenBuffered(devicePath, 5*time.Second, logr.Discard())
+	device, err := openWithOpener(devicePath, 5*time.Second, logr.Discard(), BufferedDeviceOpener)
 	if err != nil {
-		t.Fatalf("OpenBuffered failed: %v", err)
+		t.Fatalf("openWithOpener (buffered) failed: %v", err)
 	}
 	defer device.Close()
 
@@ -906,19 +871,19 @@ type fadviseCall struct {
 	advice int
 }
 
-func TestOpenBufferedValidation(t *testing.T) {
-	// Verify OpenBuffered shares the same validation as OpenWithTimeout
-	_, err := OpenBuffered("", 5*time.Second, logr.Discard())
+func TestBufferedOpenerValidation(t *testing.T) {
+	// Verify buffered opener shares the same validation as OpenWithTimeout
+	_, err := openWithOpener("", 5*time.Second, logr.Discard(), BufferedDeviceOpener)
 	if err == nil {
 		t.Error("expected error for empty path")
 	}
 
-	_, err = OpenBuffered("/nonexistent", 0, logr.Discard())
+	_, err = openWithOpener("/nonexistent", 0, logr.Discard(), BufferedDeviceOpener)
 	if err == nil {
 		t.Error("expected error for zero timeout")
 	}
 
-	_, err = OpenBuffered("/nonexistent", 500*time.Millisecond, logr.Discard())
+	_, err = openWithOpener("/nonexistent", 500*time.Millisecond, logr.Discard(), BufferedDeviceOpener)
 	if err == nil {
 		t.Error("expected error for timeout too short")
 	}
@@ -1048,9 +1013,9 @@ func TestValidateBlockModeStorage_ODirectNotSet(t *testing.T) {
 
 	// Open without O_DIRECT — simulates a code bug where the open path
 	// accidentally omits O_DIRECT.
-	dev, err := OpenBuffered(devicePath, 5*time.Second, logr.Discard())
+	dev, err := openWithOpener(devicePath, 5*time.Second, logr.Discard(), BufferedDeviceOpener)
 	if err != nil {
-		t.Fatalf("OpenBuffered failed: %v", err)
+		t.Fatalf("openWithOpener (buffered) failed: %v", err)
 	}
 	defer dev.Close()
 

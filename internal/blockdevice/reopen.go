@@ -358,6 +358,12 @@ func (d *ReopenDevice) WriteAt(p []byte, off int64) (int, error) {
 	// write may already have completed successfully, so returning an error
 	// here could cause callers to incorrectly retry a successful write.
 	// The lock will be implicitly released when the fd is eventually closed.
+	//
+	// Safety: POSIX fcntl locks are per-process, so other nodes (separate
+	// processes) are never blocked by a stuck lock on this node. On the
+	// same node, reads use freshly-opened fds whose locks are released on
+	// close. The next successful heartbeat write will re-acquire and
+	// release the lock normally.
 	if unlockErr := d.unlockRange(d.writeFile.Fd(), off, int64(len(p))); unlockErr != nil {
 		d.logger.V(1).Info("fcntl F_UNLCK failed on write fd",
 			"offset", off, "error", unlockErr)
