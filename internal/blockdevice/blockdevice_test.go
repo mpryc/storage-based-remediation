@@ -1103,3 +1103,43 @@ func TestValidateBlockModeStorage_SuccessfulPath(t *testing.T) {
 		t.Fatalf("expected successful validation, got: %v", err)
 	}
 }
+
+// TestIsDirectIOUnsupportedFS_LocalFS verifies that IsDirectIOUnsupportedFS
+// returns an empty name for local filesystems (tmpfs, ext4, xfs) that are not
+// on the blocklist.
+func TestIsDirectIOUnsupportedFS_LocalFS(t *testing.T) {
+	devicePath, cleanup := setupTestDevice(t, 4096)
+	defer cleanup()
+
+	f, err := os.Open(devicePath)
+	if err != nil {
+		t.Fatalf("failed to open test device: %v", err)
+	}
+	defer f.Close()
+
+	fsName, err := IsDirectIOUnsupportedFS(f)
+	if err != nil {
+		t.Fatalf("IsDirectIOUnsupportedFS failed: %v", err)
+	}
+	if fsName != "" {
+		t.Errorf("expected empty fsName for local filesystem, got %q", fsName)
+	}
+}
+
+// TestIsDirectIOUnsupportedFS_ClosedFd verifies that IsDirectIOUnsupportedFS
+// returns an error when called with a closed file descriptor.
+func TestIsDirectIOUnsupportedFS_ClosedFd(t *testing.T) {
+	devicePath, cleanup := setupTestDevice(t, 4096)
+	defer cleanup()
+
+	f, err := os.Open(devicePath)
+	if err != nil {
+		t.Fatalf("failed to open test device: %v", err)
+	}
+	f.Close()
+
+	_, err = IsDirectIOUnsupportedFS(f)
+	if err == nil {
+		t.Fatal("expected error for closed fd")
+	}
+}

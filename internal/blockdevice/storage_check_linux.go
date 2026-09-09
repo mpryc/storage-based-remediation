@@ -44,6 +44,25 @@ func blockModeFilesystemUnsupported(fsType int64) (string, bool) {
 	return name, ok
 }
 
+// IsDirectIOUnsupportedFS checks whether the file resides on a filesystem
+// type that does not reliably honor O_DIRECT semantics (NFS, CIFS, FUSE).
+// Some backends (e.g. Portworx sharedv4) accept the O_DIRECT flag on open()
+// without actually providing cache-bypass I/O. This check uses fstatfs(2) to
+// detect the underlying filesystem and returns the filesystem name when it is
+// on the blocklist.
+//
+// Returns ("", nil) when the filesystem is not on the blocklist.
+func IsDirectIOUnsupportedFS(f *os.File) (string, error) {
+	var stat unix.Statfs_t
+	if err := unix.Fstatfs(int(f.Fd()), &stat); err != nil {
+		return "", fmt.Errorf("fstatfs failed on %s: %w", f.Name(), err)
+	}
+	if name, unsupported := blockModeFilesystemUnsupported(int64(stat.Type)); unsupported {
+		return name, nil
+	}
+	return "", nil
+}
+
 type linuxStorageChecker struct{}
 
 // ValidateBlockModeStorage validates the locally observable requirements and

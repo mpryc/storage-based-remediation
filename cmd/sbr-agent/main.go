@@ -909,10 +909,12 @@ func (s *SBRAgent) initializeBlockModeDevices(sb *blockformat.Superblock) error 
 }
 
 // openWithDirectOrReopen tries O_DIRECT first for cache-coherent reads. If the
-// storage backend rejects O_DIRECT, it falls back to a reopen-per-read device.
-// On NFS-backed storage (most RWX volumes) the reopen triggers close-to-open
-// revalidation. On non-NFS storage that also rejects O_DIRECT, reopening still
-// avoids long-lived fd caching but does not provide the same CTO guarantee.
+// storage backend rejects O_DIRECT or the underlying filesystem is known to not
+// honor O_DIRECT semantics (NFS, CIFS, FUSE), it falls back to a
+// reopen-per-read device. On NFS-backed storage (most RWX volumes) the reopen
+// triggers close-to-open revalidation. On non-NFS storage that also rejects
+// O_DIRECT, reopening still avoids long-lived fd caching but does not provide
+// the same CTO guarantee.
 //
 // The ioTimeout is only used for the O_DIRECT path (Device). The reopen
 // fallback uses synchronous blocking I/O with no timeout — if the storage
@@ -921,12 +923,30 @@ func (s *SBRAgent) initializeBlockModeDevices(sb *blockformat.Superblock) error 
 func openWithDirectOrReopen(path string, ioTimeout time.Duration, log logr.Logger) (mocks.BlockDeviceInterface, error) {
 	dev, err := blockdevice.OpenWithTimeout(path, ioTimeout, log)
 	if err == nil {
-		log.Info("Opened device with O_DIRECT", "path", path)
-		return dev, nil
+		// Some backends (e.g. Portworx sharedv4) accept O_DIRECT on open()
+		// without actually providing cache-bypass I/O. Check the filesystem
+		// type via fstatfs to detect this and fall back to reopen-per-read.
+		if fsName, fsErr := blockdevice.IsDirectIOUnsupportedFS(dev.File()); fsErr != nil {
+			log.Info("fstatfs check failed, falling back to reopen-per-read",
+				"path", path, "error", fsErr.Error())
+			err = fsErr
+		} else if fsName != "" {
+			log.Info("Filesystem does not reliably honor O_DIRECT, falling back to reopen-per-read",
+				"path", path, "filesystem", fsName)
+			err = fmt.Errorf("%s filesystem does not reliably honor O_DIRECT", fsName)
+		} else {
+			log.Info("Opened device with O_DIRECT", "path", path)
+			return dev, nil
+		}
+		dev.Close()
 	}
 
-	log.Info("O_DIRECT not supported, falling back to reopen-per-read (synchronous, no timeout)",
-		"path", path, "directError", err.Error())
+	fallbackReason := "O_DIRECT not supported"
+	if err != nil {
+		fallbackReason = err.Error()
+	}
+	log.Info("Falling back to reopen-per-read (synchronous, no timeout)",
+		"path", path, "reason", fallbackReason)
 
 	reopenDev, reopenErr := blockdevice.NewReopenDevice(path, log)
 	if reopenErr != nil {
