@@ -263,18 +263,19 @@ func (r *StorageBasedRemediationConfigReconciler) ensureSCCPermissions(
 	return controllerutil.OperationResultNone, nil
 }
 
-// validateStorageClass validates that the specified storage class supports ReadWriteMany access mode
+// validateStorageClass validates that the specified storage class is not known to be
+// incompatible with SBR. Unknown provisioners are accepted — the agent's runtime
+// preflight checks (write/read-back test) and the storage write check
+// (StorageValidation.ConcurrentWriteable) are the authoritative validation.
 func (r *StorageBasedRemediationConfigReconciler) validateStorageClass(
 	ctx context.Context, sbrConfig *medik8sv1alpha1.StorageBasedRemediationConfig, logger logr.Logger) error {
 	if !sbrConfig.Spec.HasSharedStorage() {
-		// No shared storage configured, nothing to validate
 		return fmt.Errorf("no shared storage configured")
 	}
 
 	storageClassName := sbrConfig.Spec.GetSharedStorageStorageClass()
 	logger = logger.WithValues("storageClass", storageClassName)
 
-	// Get the StorageClass object
 	storageClass := &storagev1.StorageClass{}
 	err := r.Get(ctx, types.NamespacedName{Name: storageClassName}, storageClass)
 	if err != nil {
@@ -286,215 +287,37 @@ func (r *StorageBasedRemediationConfigReconciler) validateStorageClass(
 
 	provisioner := storageClass.Provisioner
 
-	// Block mode validation: check for RWX block-capable provisioners
-	if sbrConfig.Spec.IsBlockMode() {
-		if r.isRWXBlockCompatibleProvisioner(provisioner) {
-			logger.Info("StorageClass validation passed (block mode)", "provisioner", provisioner)
-			return nil
-		}
-		// NFS/filesystem-only provisioners cannot provide RWX block volumes
-		if r.isRWXCompatibleProvisioner(provisioner) && !r.isRWXBlockCompatibleProvisioner(provisioner) {
-			return fmt.Errorf(
-				"StorageClass '%s' uses provisioner '%s' that supports RWX filesystem but not RWX block volumes; "+
-					"use a block-capable provisioner (e.g. Ceph RBD) or switch to Filesystem volume mode",
-				storageClassName, provisioner)
-		}
-		if r.isRWXIncompatibleProvisioner(provisioner) {
-			return fmt.Errorf(
-				"StorageClass '%s' uses provisioner '%s' that does not support "+
-					"ReadWriteMany block volumes required for SBR block mode",
-				storageClassName, provisioner)
-		}
-		logger.Info("StorageClass uses unknown provisioner, cannot verify RWX block support", "provisioner", provisioner)
-		return nil
-	}
-
-	// Filesystem mode validation
-	if r.isRWXCompatibleProvisioner(provisioner) {
-		logger.Info("StorageClass validation passed", "provisioner", provisioner)
-
-		// For NFS-based storage, validate mount options for SBR cache coherency
-		if r.isNFSBasedProvisioner(provisioner) {
-			if err := r.validateNFSMountOptions(storageClass, logger); err != nil {
-				logger.Info("StorageClass mount options validation failed", "error", err)
-				return fmt.Errorf("StorageClass '%s' mount options are not configured for SBR cache coherency: %w",
-					storageClassName, err)
-			}
-			logger.Info("StorageClass mount options validation passed")
-		}
-
-		return nil
-	}
-
-	// Check if the provisioner is known to be incompatible
+	// Fast-fail on provisioners that are known to never support RWX (RWO-only block storage).
+	// These cannot provide shared multi-node access regardless of volume mode.
 	if r.isRWXIncompatibleProvisioner(provisioner) {
 		return fmt.Errorf(
-			"StorageClass '%s' uses provisioner '%s' that does not support "+
-				"ReadWriteMany access mode required for SBR shared storage",
+			"StorageClass '%s' uses provisioner '%s' which only supports ReadWriteOnce; "+
+				"SBR requires ReadWriteMany shared storage",
 			storageClassName, provisioner)
 	}
 
-	// For unknown provisioners, test with a temporary PVC
-	logger.Info("StorageClass uses unknown provisioner, testing ReadWriteMany support", "provisioner", provisioner)
-	if err := r.testRWXSupport(ctx, sbrConfig, storageClassName, logger); err != nil {
-		return fmt.Errorf("StorageClass '%s' does not support ReadWriteMany access mode required for SBR shared storage: %w",
-			storageClassName, err)
-	}
-
+	// All other provisioners are accepted. The agent's preflight write/read-back test and
+	// the controller's storage write check (StorageValidation.ConcurrentWriteable) validate
+	// actual I/O capability at runtime. The agent also auto-detects cache coherency strategy
+	// (O_DIRECT, reopen-per-read with fcntl locking) so no mount option validation is needed.
 	logger.Info("StorageClass validation passed", "provisioner", provisioner)
 	return nil
 }
 
-// isRWXBlockCompatibleProvisioner checks if a CSI provisioner supports ReadWriteMany with raw block volumes.
-// This list is not exhaustive — unknown provisioners are accepted with a log warning.
-// TODO: detect block RWX capabilities dynamically if Kubernetes ever exposes them via StorageClass or CSIDriver.
-func (r *StorageBasedRemediationConfigReconciler) isRWXBlockCompatibleProvisioner(provisioner string) bool {
-	rwxBlockProvisioners := map[string]bool{
-		// Ceph RBD supports RWX block via multi-attach
-		"rbd.csi.ceph.com":                   true,
-		"openshift-storage.rbd.csi.ceph.com": true,
-	}
-	return rwxBlockProvisioners[provisioner]
-}
-
-// isRWXCompatibleProvisioner checks if a CSI provisioner is known to support ReadWriteMany
-func (r *StorageBasedRemediationConfigReconciler) isRWXCompatibleProvisioner(provisioner string) bool {
-	// Known RWX-compatible provisioners
-	rwxProvisioners := map[string]bool{
-		// AWS
-		"efs.csi.aws.com": true,
-
-		// Azure
-		"file.csi.azure.com": true,
-
-		// GCP
-		"filestore.csi.storage.gke.io": true,
-
-		// NFS
-		"nfs.csi.k8s.io": true,
-		"cluster.local/nfs-subdir-external-provisioner": true,
-		"k8s-sigs.io/nfs-subdir-external-provisioner":   true,
-
-		// CephFS
-		"cephfs.csi.ceph.com":                   true,
-		"openshift-storage.cephfs.csi.ceph.com": true,
-
-		// GlusterFS
-		"gluster.org/glusterfs": true,
-
-		// Other known RWX provisioners
-		"nfs-provisioner": true,
-		"csi-nfsplugin":   true,
-	}
-
-	return rwxProvisioners[provisioner]
-}
-
-// isRWXIncompatibleProvisioner checks if a CSI provisioner is known to NOT support ReadWriteMany
+// isRWXIncompatibleProvisioner checks if a CSI provisioner is known to NOT support ReadWriteMany.
+// This is a fast-fail safeguard — it prevents creating a PVC that will never work.
 func (r *StorageBasedRemediationConfigReconciler) isRWXIncompatibleProvisioner(provisioner string) bool {
-	// Known RWX-incompatible provisioners (block storage that only supports RWO)
 	rwxIncompatibleProvisioners := map[string]bool{
-		// AWS
-		"ebs.csi.aws.com": true,
-		"aws-ebs":         true,
-
-		// Azure
-		"disk.csi.azure.com": true,
-		"azure-disk":         true,
-
-		// GCP
-		"pd.csi.storage.gke.io": true,
-		"gce-pd":                true,
-
-		// VMware
-		"csi.vsphere.vmware.com": true,
-
-		// OpenStack
-		"cinder.csi.openstack.org": true,
-
-		// Other known block storage provisioners
-		"csi.trident.netapp.io": true, // NetApp Trident (when configured for block)
-		"iscsi.csi.k8s.io":      true, // iSCSI CSI driver
+		"ebs.csi.aws.com":             true, // AWS EBS
+		"aws-ebs":                     true, // AWS EBS (legacy)
+		"disk.csi.azure.com":          true, // Azure Disk
+		"azure-disk":                  true, // Azure Disk (legacy)
+		"pd.csi.storage.gke.io":       true, // GCP Persistent Disk
+		"gce-pd":                      true, // GCP PD (legacy)
+		"csi.vsphere.vmware.com":      true, // VMware vSphere
+		"cinder.csi.openstack.org":    true, // OpenStack Cinder
 	}
-
 	return rwxIncompatibleProvisioners[provisioner]
-}
-
-// isNFSBasedProvisioner checks if a provisioner uses NFS and requires mount option validation
-func (r *StorageBasedRemediationConfigReconciler) isNFSBasedProvisioner(provisioner string) bool {
-	// NFS-based provisioners that use standard NFS mount options
-	nfsProvisioners := map[string]bool{
-		// AWS EFS uses NFS4
-		"efs.csi.aws.com": true,
-
-		// Standard NFS provisioners
-		"nfs.csi.k8s.io": true,
-		"cluster.local/nfs-subdir-external-provisioner": true,
-		"k8s-sigs.io/nfs-subdir-external-provisioner":   true,
-		"nfs-provisioner": true,
-		"csi-nfsplugin":   true,
-	}
-
-	return nfsProvisioners[provisioner]
-}
-
-// validateNFSMountOptions validates that NFS mount options include cache coherency settings for SBR
-func (r *StorageBasedRemediationConfigReconciler) validateNFSMountOptions(storageClass *storagev1.StorageClass, logger logr.Logger) error {
-	if storageClass != nil {
-		logger.Info("Skipping NFS mount options validation - TODO: Until we find some storage that actually works with SBR")
-		return nil
-	}
-	mountOptions := storageClass.MountOptions
-	logger = logger.WithValues("mountOptions", mountOptions)
-
-	// Required mount options for SBR cache coherency
-	requiredOptions := []string{"cache=none", "sync"}
-	recommendedOptions := []string{"local_lock=none"}
-
-	// Check for required options
-	missingRequired := []string{}
-	for _, required := range requiredOptions {
-		found := false
-		for _, option := range mountOptions {
-			if option == required {
-				found = true
-				break
-			}
-		}
-		if !found {
-			missingRequired = append(missingRequired, required)
-		}
-	}
-
-	if len(missingRequired) > 0 {
-		return fmt.Errorf("missing required NFS mount options for SBR cache coherency: %v. "+
-			"These options are required to prevent NFS client-side caching issues "+
-			"that can cause SBR heartbeat coordination failures",
-			missingRequired)
-	}
-
-	// Check for recommended options (warning only)
-	missingRecommended := []string{}
-	for _, recommended := range recommendedOptions {
-		found := false
-		for _, option := range mountOptions {
-			if option == recommended {
-				found = true
-				break
-			}
-		}
-		if !found {
-			missingRecommended = append(missingRecommended, recommended)
-		}
-	}
-
-	if len(missingRecommended) > 0 {
-		logger.Info("StorageClass is missing recommended NFS mount options for optimal SBR operation",
-			"missingOptions", missingRecommended)
-	}
-
-	logger.Info("NFS mount options validation passed", "checkedOptions", requiredOptions)
-	return nil
 }
 
 // patchPVReclaimToDelete patches a PV's reclaimPolicy to Delete
@@ -513,101 +336,6 @@ func (r *StorageBasedRemediationConfigReconciler) patchPVReclaimToDelete(
 		}
 		logger.Info("Patched PV reclaim policy to Delete", "pv", pvName)
 	}
-	return nil
-}
-
-// testRWXSupport tests if a storage class actually supports ReadWriteMany by creating a temporary PVC
-func (r *StorageBasedRemediationConfigReconciler) testRWXSupport(
-	ctx context.Context, sbrConfig *medik8sv1alpha1.StorageBasedRemediationConfig, storageClassName string, logger logr.Logger) error {
-	// Create a temporary PVC with ReadWriteMany to test compatibility
-	testPVCName := fmt.Sprintf("%s-rwx-test", sbrConfig.Name)
-
-	testPVC := &corev1.PersistentVolumeClaim{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      testPVCName,
-			Namespace: sbrConfig.Namespace,
-			Labels: map[string]string{
-				"app.kubernetes.io/name":      "sbr-operator",
-				"app.kubernetes.io/component": "storage-validation",
-				"sbrconfig":                   sbrConfig.Name,
-				"temp-test":                   "true",
-			},
-		},
-		Spec: corev1.PersistentVolumeClaimSpec{
-			AccessModes: []corev1.PersistentVolumeAccessMode{
-				corev1.ReadWriteMany,
-			},
-			Resources: corev1.VolumeResourceRequirements{
-				Requests: corev1.ResourceList{
-					corev1.ResourceStorage: resource.MustParse("1Gi"), // Minimal size for testing
-				},
-			},
-			StorageClassName: &storageClassName,
-		},
-	}
-
-	// Best-effort delete of any stale PVC with this name before creating a fresh one.
-	// No wait: if Create still fails with AlreadyExists the error is returned and
-	// the reconcile loop retries on the next requeue.
-	if deleteErr := r.Delete(ctx, &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Name: testPVCName, Namespace: sbrConfig.Namespace}}); deleteErr != nil && !errors.IsNotFound(deleteErr) {
-		return fmt.Errorf("failed to delete stale test PVC '%s': %w", testPVCName, deleteErr)
-	}
-
-	// Create the test PVC
-	logger.Info("Creating temporary PVC to test ReadWriteMany support")
-	err := r.Create(ctx, testPVC)
-	if err != nil {
-		return fmt.Errorf("failed to create test PVC: %w", err)
-	}
-
-	// Schedule cleanup regardless of test outcome
-	defer func() {
-		cleanupCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		defer cancel()
-
-		// Patch the PV reclaimPolicy to Delete if the PVC is bound.
-		// Error is logged but not returned since this is best-effort cleanup in a defer.
-		if pvName := testPVC.Spec.VolumeName; pvName != "" {
-			_ = r.patchPVReclaimToDelete(cleanupCtx, pvName, logger)
-		}
-
-		if deleteErr := r.Delete(cleanupCtx, testPVC); deleteErr != nil {
-			logger.Error(deleteErr, "Failed to cleanup test PVC", "testPVC", testPVCName)
-		} else {
-			logger.Info("Successfully cleaned up test PVC", "testPVC", testPVCName)
-		}
-	}()
-
-	// Wait a short time and check if the PVC was rejected due to unsupported access mode
-	time.Sleep(5 * time.Second)
-
-	// Get the PVC to check its status
-	err = r.Get(ctx, types.NamespacedName{Name: testPVCName, Namespace: sbrConfig.Namespace}, testPVC)
-	if err != nil {
-		return fmt.Errorf("failed to get test PVC status: %w", err)
-	}
-
-	// Check for events that indicate RWX incompatibility
-	events := &corev1.EventList{}
-	err = r.List(ctx, events, client.InNamespace(sbrConfig.Namespace),
-		client.MatchingFields{"involvedObject.name": testPVCName})
-	if err != nil {
-		logger.Error(err, "Failed to list events for test PVC")
-	} else {
-		for _, evt := range events.Items {
-			message := strings.ToLower(evt.Message)
-			if strings.Contains(message, "readwritemany") &&
-				(strings.Contains(message, "not supported") || strings.Contains(message, "unsupported") ||
-					strings.Contains(message, "invalid")) {
-				return fmt.Errorf("storage class does not support ReadWriteMany access mode: %s", evt.Message)
-			}
-			if strings.Contains(message, "access mode") && strings.Contains(message, "not supported") {
-				return fmt.Errorf("storage class does not support required access mode: %s", evt.Message)
-			}
-		}
-	}
-
-	logger.Info("ReadWriteMany test passed", "testPVC", testPVCName)
 	return nil
 }
 

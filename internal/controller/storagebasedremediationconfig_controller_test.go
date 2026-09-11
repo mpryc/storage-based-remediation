@@ -1063,31 +1063,6 @@ var _ = Describe("StorageBasedRemediationConfig Controller", func() {
 			Expect(err.Error()).To(ContainSubstring("no shared storage configured"))
 		})
 
-		It("should recognize known RWX-compatible provisioners", func() {
-			testCases := []struct {
-				name        string
-				provisioner string
-				compatible  bool
-			}{
-				{"AWS EFS", "efs.csi.aws.com", true},
-				{"Azure Files", "file.csi.azure.com", true},
-				{"GCP Filestore", "filestore.csi.storage.gke.io", true},
-				{"NFS CSI", "nfs.csi.k8s.io", true},
-				{"CephFS", "cephfs.csi.ceph.com", true},
-				{"AWS EBS", "ebs.csi.aws.com", false},
-				{"Azure Disk", "disk.csi.azure.com", false},
-				{"GCP Persistent Disk", "pd.csi.storage.gke.io", false},
-			}
-
-			for _, tc := range testCases {
-				By(fmt.Sprintf("testing %s provisioner (%s)", tc.name, tc.provisioner))
-
-				compatible := validationReconciler.isRWXCompatibleProvisioner(tc.provisioner)
-				Expect(compatible).To(Equal(tc.compatible),
-					fmt.Sprintf("Expected %s (%s) to be compatible=%t", tc.name, tc.provisioner, tc.compatible))
-			}
-		})
-
 		It("should recognize known RWX-incompatible provisioners", func() {
 			testCases := []struct {
 				name         string
@@ -1113,8 +1088,8 @@ var _ = Describe("StorageBasedRemediationConfig Controller", func() {
 			}
 		})
 
-		Context("When testing unknown provisioners", func() {
-			It("should test unknown provisioner", func() {
+		Context("When using unknown provisioners", func() {
+			It("should accept unknown provisioners and let the storage write check validate at runtime", func() {
 				By("creating a custom storage class with unknown provisioner")
 				customStorageClass := &storagev1.StorageClass{
 					ObjectMeta: metav1.ObjectMeta{
@@ -1127,7 +1102,7 @@ var _ = Describe("StorageBasedRemediationConfig Controller", func() {
 				}
 				Expect(k8sClient.Create(ctx, customStorageClass)).To(Succeed())
 
-				By("creating StorageBasedRemediationConfig with unknown provisioner")
+				By("validating that the unknown provisioner passes StorageClass validation")
 				sbrConfig := &medik8sv1alpha1.StorageBasedRemediationConfig{
 					ObjectMeta: metav1.ObjectMeta{
 						Name:      "test-unknown-provisioner",
@@ -1137,103 +1112,16 @@ var _ = Describe("StorageBasedRemediationConfig Controller", func() {
 						SharedStorageClass: "custom-unknown-provisioner",
 					},
 				}
-				Expect(k8sClient.Create(ctx, sbrConfig)).To(Succeed())
-
-				By("reconciling the StorageBasedRemediationConfig")
-				counter, result, err := runReconcile(ctx, validationReconciler, types.NamespacedName{
-					Name:      sbrConfig.Name,
-					Namespace: sbrConfig.Namespace,
-				})
-				Expect(counter).To(BeNumerically("==", 4))
-				Expect(result).To(Equal(reconcile.Result{}))
-
-				By("expecting reconciliation to complete (may succeed or fail depending on actual provisioner capability)")
-				Expect(err).To(HaveOccurred())
-				Expect(err.Error()).To(ContainSubstring("ReadWriteMany"))
+				err := validationReconciler.validateStorageClass(ctx, sbrConfig, logr.Discard())
+				Expect(err).NotTo(HaveOccurred(),
+					"unknown provisioners should be accepted; the storage write check validates at runtime")
 			})
 		})
 
-		Context("When a stale test PVC exists from a previous interrupted run (RHWA-1017)", func() {
-			var (
-				customStorageClass *storagev1.StorageClass
-				stalePVC           *corev1.PersistentVolumeClaim
-				sbrConfig          *medik8sv1alpha1.StorageBasedRemediationConfig
-			)
-
-			BeforeEach(func() {
-				customStorageClass = &storagev1.StorageClass{
-					ObjectMeta:  metav1.ObjectMeta{Name: "stale-pvc-test-sc"},
-					Provisioner: "custom.example.com/stale-pvc-test",
-				}
-				Expect(k8sClient.Create(ctx, customStorageClass)).To(Succeed())
-				DeferCleanup(func() {
-					Expect(k8sClient.Delete(ctx, customStorageClass)).To(Succeed())
-				})
-
-				sbrConfigName := "test-stale-pvc-cleanup"
-
-				stalePVC = &corev1.PersistentVolumeClaim{
-					ObjectMeta: metav1.ObjectMeta{
-						Name:      fmt.Sprintf("%s-rwx-test", sbrConfigName),
-						Namespace: validationNamespace,
-					},
-					Spec: corev1.PersistentVolumeClaimSpec{
-						AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteMany},
-						Resources: corev1.VolumeResourceRequirements{
-							Requests: corev1.ResourceList{
-								corev1.ResourceStorage: resource.MustParse("1Gi"),
-							},
-						},
-						StorageClassName: &customStorageClass.Name,
-					},
-				}
-				Expect(k8sClient.Create(ctx, stalePVC)).To(Succeed())
-
-				// envtest has no pvc-protection controller to clear the kubernetes.io/pvc-protection
-				// finalizer, so deletion would stall. Strip it manually; a real cluster handles this automatically.
-				patch := client.MergeFrom(stalePVC.DeepCopy())
-				stalePVC.Finalizers = nil
-				Expect(k8sClient.Patch(ctx, stalePVC, patch)).To(Succeed())
-
-				sbrConfig = &medik8sv1alpha1.StorageBasedRemediationConfig{
-					ObjectMeta: metav1.ObjectMeta{
-						Name:      sbrConfigName,
-						Namespace: validationNamespace,
-					},
-					Spec: medik8sv1alpha1.StorageBasedRemediationConfigSpec{
-						SharedStorageClass: customStorageClass.Name,
-					},
-				}
-				Expect(k8sClient.Create(ctx, sbrConfig)).To(Succeed())
-				DeferCleanup(func() {
-					Expect(k8sClient.Delete(ctx, sbrConfig)).To(Succeed())
-				})
-			})
-
-			It("should replace a stale test PVC with a fresh one on reconcile", func() {
-				_, _, _ = runReconcile(ctx, validationReconciler, types.NamespacedName{
-					Name:      sbrConfig.Name,
-					Namespace: sbrConfig.Namespace,
-				})
-
-				finalPVC := &corev1.PersistentVolumeClaim{}
-				err := k8sClient.Get(ctx, types.NamespacedName{Name: stalePVC.Name, Namespace: validationNamespace}, finalPVC)
-				Expect(err).NotTo(HaveOccurred())
-				Expect(finalPVC.UID).NotTo(Equal(stalePVC.UID),
-					"PVC should be a newly created one, not the original stale PVC")
-				// In envtest, pvc-protection finalizer is never cleared so the PVC stays
-				// in Terminating after the controller's defer delete; in a real cluster it
-				// would be fully removed.
-				Expect(finalPVC.DeletionTimestamp).NotTo(BeNil(),
-					"New PVC should be in Terminating state (deleted by controller defer cleanup)")
-			})
-		})
 	})
 
 	Context("When verifying PV reclaim-policy cleanup (RHWA-1017)", func() {
 		const (
-			pvPatchRetainSCName    = "pv-patch-retain-sc"
-			pvPatchUnknownProv     = "custom.example.com/pv-patch-test"
 			pvPatchCephSCName      = "pv-patch-ceph-sc"
 			pvPatchCephProvisioner = "openshift-storage.cephfs.csi.ceph.com"
 		)
@@ -1256,19 +1144,7 @@ var _ = Describe("StorageBasedRemediationConfig Controller", func() {
 				Scheme: k8sClient.Scheme(),
 			}
 
-			// Unknown-provisioner SC with Retain policy — triggers testRWXSupport
 			reclaimPolicy := corev1.PersistentVolumeReclaimRetain
-			retainSC := &storagev1.StorageClass{
-				ObjectMeta:    metav1.ObjectMeta{Name: pvPatchRetainSCName},
-				Provisioner:   pvPatchUnknownProv,
-				ReclaimPolicy: &reclaimPolicy,
-			}
-			err := k8sClient.Create(ctx, retainSC)
-			if err != nil && !errors.IsAlreadyExists(err) {
-				Expect(err).NotTo(HaveOccurred())
-			}
-
-			// Known-RWX Ceph SC — skips testRWXSupport (used by the handleDeletion test)
 			cephSC := &storagev1.StorageClass{
 				ObjectMeta:    metav1.ObjectMeta{Name: pvPatchCephSCName},
 				Provisioner:   pvPatchCephProvisioner,
@@ -1278,7 +1154,7 @@ var _ = Describe("StorageBasedRemediationConfig Controller", func() {
 					"fsName":    "ocs-storagecluster-cephfilesystem",
 				},
 			}
-			err = k8sClient.Create(ctx, cephSC)
+			err := k8sClient.Create(ctx, cephSC)
 			if err != nil && !errors.IsAlreadyExists(err) {
 				Expect(err).NotTo(HaveOccurred())
 			}
@@ -1293,81 +1169,12 @@ var _ = Describe("StorageBasedRemediationConfig Controller", func() {
 			})
 		})
 
-		// Verifies that the test PVC has no OwnerReference (preventing a runaway reconcile loop)
-		// and that a bound test PV with reclaimPolicy Retain is patched to Delete on cleanup.
-		// Both checks share the same goroutine observation window during testRWXSupport's 5s sleep.
-		It("should not set OwnerReference on test PVC and should patch the bound test PV reclaimPolicy to Delete", func() {
-			const sbrConfigName = "test-rwxsupport-cleanup"
-			sbrConfig := &medik8sv1alpha1.StorageBasedRemediationConfig{
-				ObjectMeta: metav1.ObjectMeta{Name: sbrConfigName, Namespace: pvPatchNamespace},
-				Spec:       medik8sv1alpha1.StorageBasedRemediationConfigSpec{SharedStorageClass: pvPatchRetainSCName},
-			}
-			Expect(k8sClient.Create(ctx, sbrConfig)).To(Succeed())
-			DeferCleanup(func() { _ = k8sClient.Delete(ctx, sbrConfig) })
-
-			// Pre-create a PV with Retain policy to simulate a provisioner bound volume.
-			// PersistentVolume is cluster-scoped, so derive the name from the unique namespace.
-			pvName := fmt.Sprintf("test-pv-%s", pvPatchNamespace)
-			pv := &corev1.PersistentVolume{
-				ObjectMeta: metav1.ObjectMeta{Name: pvName},
-				Spec: corev1.PersistentVolumeSpec{
-					Capacity:                      corev1.ResourceList{corev1.ResourceStorage: resource.MustParse("1Gi")},
-					AccessModes:                   []corev1.PersistentVolumeAccessMode{corev1.ReadWriteMany},
-					PersistentVolumeReclaimPolicy: corev1.PersistentVolumeReclaimRetain,
-					PersistentVolumeSource: corev1.PersistentVolumeSource{
-						NFS: &corev1.NFSVolumeSource{Server: "fake-nfs", Path: "/data"},
-					},
-				},
-			}
-			Expect(k8sClient.Create(ctx, pv)).To(Succeed())
-			DeferCleanup(func() { _ = k8sClient.Delete(ctx, pv) })
-
-			// testRWXSupport creates the test PVC and then sleeps 5s before re-fetching it.
-			// Run the reconcile in the background so we can inspect the PVC during that window.
-			reconcileDone := make(chan struct{})
-			go func() {
-				defer GinkgoRecover()
-				defer close(reconcileDone)
-				runReconcile(ctx, pvPatchReconciler, types.NamespacedName{
-					Name: sbrConfigName, Namespace: pvPatchNamespace,
-				})
-			}()
-
-			testPVCName := fmt.Sprintf("%s-rwx-test", sbrConfigName)
-			testPVC := &corev1.PersistentVolumeClaim{}
-			Eventually(func() error {
-				return k8sClient.Get(ctx,
-					types.NamespacedName{Name: testPVCName, Namespace: pvPatchNamespace}, testPVC)
-			}, 8*time.Second, 200*time.Millisecond).Should(Succeed())
-
-			By("verifying the test PVC carries no OwnerReference")
-			Expect(testPVC.OwnerReferences).To(BeEmpty(),
-				"the test PVC must not carry an OwnerReference to the SBRConfig")
-
-			By("simulating a provisioner binding the test PVC to the Retain PV")
-			patch := client.MergeFrom(testPVC.DeepCopy())
-			testPVC.Spec.VolumeName = pvName
-			Expect(k8sClient.Patch(ctx, testPVC, patch)).To(Succeed())
-
-			<-reconcileDone
-
-			By("verifying the test PV reclaim policy was patched to Delete")
-			fetchedPV := &corev1.PersistentVolume{}
-			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: pvName}, fetchedPV)).To(Succeed())
-			Expect(fetchedPV.Spec.PersistentVolumeReclaimPolicy).To(
-				Equal(corev1.PersistentVolumeReclaimDelete),
-				"test PV reclaim policy must be patched to Delete before the test PVC is deleted",
-			)
-		})
-
 		// Covers the handleDeletion fix: shared-storage PV with Retain policy is patched to
 		// Delete before the SBRConfig finalizer is removed, preventing Released PV accumulation.
 		It("should patch the shared-storage PV reclaimPolicy to Delete during SBRConfig deletion", func() {
 			const sbrConfigName = "test-deletion-pv-patch"
 			sbrConfig := &medik8sv1alpha1.StorageBasedRemediationConfig{
 				ObjectMeta: metav1.ObjectMeta{Name: sbrConfigName, Namespace: pvPatchNamespace},
-				// Ceph is known-RWX-compatible so validateStorageClass short-circuits
-				// and testRWXSupport is never called.
 				Spec: medik8sv1alpha1.StorageBasedRemediationConfigSpec{SharedStorageClass: pvPatchCephSCName},
 			}
 			Expect(k8sClient.Create(ctx, sbrConfig)).To(Succeed())
@@ -1677,47 +1484,6 @@ var _ = Describe("StorageBasedRemediationConfig Controller", func() {
 			By("verifying resource requests and limits")
 			Expect(container.Resources.Requests).ToNot(BeEmpty())
 			Expect(container.Resources.Limits).ToNot(BeEmpty())
-		})
-
-		It("should validate RBD provisioner as block-compatible", func() {
-			Expect(blockReconciler.isRWXBlockCompatibleProvisioner("rbd.csi.ceph.com")).To(BeTrue())
-			Expect(blockReconciler.isRWXBlockCompatibleProvisioner("openshift-storage.rbd.csi.ceph.com")).To(BeTrue())
-		})
-
-		It("should reject NFS provisioner for block mode", func() {
-			Expect(blockReconciler.isRWXBlockCompatibleProvisioner("nfs.csi.k8s.io")).To(BeFalse())
-			Expect(blockReconciler.isRWXBlockCompatibleProvisioner("efs.csi.aws.com")).To(BeFalse())
-		})
-
-		It("should reject filesystem-only provisioner for block mode via validateStorageClass", func() {
-			blockMode := medik8sv1alpha1.SharedStorageVolumeModeBlock
-			sbrConfig := &medik8sv1alpha1.StorageBasedRemediationConfig{
-				ObjectMeta: metav1.ObjectMeta{Name: "block-validation-test", Namespace: blockNamespace},
-				Spec: medik8sv1alpha1.StorageBasedRemediationConfigSpec{
-					SharedStorageClass:      validSharedStorageClass, // CephFS — filesystem only
-					SharedStorageVolumeMode: &blockMode,
-				},
-			}
-			Expect(k8sClient.Create(ctx, sbrConfig)).To(Succeed())
-
-			err := blockReconciler.validateStorageClass(ctx, sbrConfig, logr.Discard())
-			Expect(err).To(HaveOccurred())
-			Expect(err.Error()).To(ContainSubstring("not RWX block volumes"))
-		})
-
-		It("should accept RBD provisioner for block mode via validateStorageClass", func() {
-			blockMode := medik8sv1alpha1.SharedStorageVolumeModeBlock
-			sbrConfig := &medik8sv1alpha1.StorageBasedRemediationConfig{
-				ObjectMeta: metav1.ObjectMeta{Name: "block-rbd-validation", Namespace: blockNamespace},
-				Spec: medik8sv1alpha1.StorageBasedRemediationConfigSpec{
-					SharedStorageClass:      blockStorageClass, // RBD — block capable
-					SharedStorageVolumeMode: &blockMode,
-				},
-			}
-			Expect(k8sClient.Create(ctx, sbrConfig)).To(Succeed())
-
-			err := blockReconciler.validateStorageClass(ctx, sbrConfig, logr.Discard())
-			Expect(err).NotTo(HaveOccurred())
 		})
 
 		It("should set volumeMode Block on PVC for block mode", func() {
