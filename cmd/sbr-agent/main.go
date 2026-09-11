@@ -26,6 +26,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"path/filepath"
 	"strconv"
 	"sync"
 	"syscall"
@@ -861,6 +862,15 @@ func (s *SBRAgent) initializeBlockModeDevices(sb *blockformat.Superblock) error 
 		return fmt.Errorf("failed to open block device %s: %w", s.heartbeatDevicePath, err)
 	}
 
+	// Verify the backing storage is suitable for block mode. Some
+	// filesystem-backed storage implementations do not provide the direct-I/O
+	// and cross-node visibility semantics required by block mode, even when
+	// O_DIRECT is accepted on the file descriptor.
+	if err := blockdevice.DefaultStorageChecker.ValidateBlockModeStorage(dev.File(), s.heartbeatDevicePath); err != nil {
+		dev.Close()
+		return fmt.Errorf("storage backend incompatible with block mode: %w", err)
+	}
+
 	// Check quiesce flag before committing state
 	if sb.IsQuiesced() {
 		dev.Close()
@@ -898,18 +908,69 @@ func (s *SBRAgent) initializeBlockModeDevices(sb *blockformat.Superblock) error 
 	return nil
 }
 
-// initializeFilesystemModeDevices opens separate heartbeat and fence device files.
-func (s *SBRAgent) initializeFilesystemModeDevices() error {
-	heartbeatDevice, err := blockdevice.OpenWithTimeout(s.heartbeatDevicePath, s.ioTimeout,
-		logger.WithName("heartbeat-device"))
-	if err != nil {
-		return fmt.Errorf("failed to open heartbeat device %s with timeout %v: %w",
-			s.heartbeatDevicePath, s.ioTimeout, err)
+// openWithDirectOrReopen tries O_DIRECT first for cache-coherent reads. If the
+// storage backend rejects O_DIRECT or the underlying filesystem is known to not
+// honor O_DIRECT semantics (NFS, CIFS, FUSE), it falls back to a
+// reopen-per-read device. On NFS-backed storage (most RWX volumes) the reopen
+// triggers close-to-open revalidation. On non-NFS storage that also rejects
+// O_DIRECT, reopening still avoids long-lived fd caching but does not provide
+// the same CTO guarantee.
+//
+// The ioTimeout is only used for the O_DIRECT path (Device). The reopen
+// fallback uses synchronous blocking I/O with no timeout — if the storage
+// backend is unresponsive, the caller blocks, which is the correct behavior
+// for a fencing device (blocked heartbeat → watchdog fires).
+func openWithDirectOrReopen(path string, ioTimeout time.Duration, log logr.Logger) (mocks.BlockDeviceInterface, error) {
+	dev, err := blockdevice.OpenWithTimeout(path, ioTimeout, log)
+	if err == nil {
+		// Some backends (e.g. Portworx sharedv4) accept O_DIRECT on open()
+		// without actually providing cache-bypass I/O. Check the filesystem
+		// type via fstatfs to detect this and fall back to reopen-per-read.
+		if fsName, fsErr := blockdevice.IsDirectIOUnsupportedFS(dev.File()); fsErr != nil {
+			log.Info("fstatfs check failed, falling back to reopen-per-read",
+				"path", path, "error", fsErr.Error())
+			err = fsErr
+		} else if fsName != "" {
+			log.Info("Filesystem does not reliably honor O_DIRECT, falling back to reopen-per-read",
+				"path", path, "filesystem", fsName)
+			err = fmt.Errorf("%s filesystem does not reliably honor O_DIRECT", fsName)
+		} else {
+			log.Info("Opened device with O_DIRECT", "path", path)
+			return dev, nil
+		}
+		dev.Close()
 	}
 
-	fenceDevice, err := blockdevice.OpenWithTimeout(s.fenceDevicePath, s.ioTimeout, logger.WithName("fence-device"))
+	fallbackReason := "O_DIRECT not supported"
 	if err != nil {
-		return fmt.Errorf("failed to open fence device %s with timeout %v: %w", s.fenceDevicePath, s.ioTimeout, err)
+		fallbackReason = err.Error()
+	}
+	log.Info("Falling back to reopen-per-read (synchronous, no timeout)",
+		"path", path, "reason", fallbackReason)
+
+	reopenDev, reopenErr := blockdevice.NewReopenDevice(path, log)
+	if reopenErr != nil {
+		return nil, fmt.Errorf("failed to open device %s (O_DIRECT: %v, reopen: %w)", path, err, reopenErr)
+	}
+
+	return reopenDev, nil
+}
+
+// initializeFilesystemModeDevices opens separate heartbeat and fence device files.
+// It tries O_DIRECT first for cache-coherent reads, falling back to a
+// reopen-per-read strategy that leverages NFS close-to-open consistency
+// when O_DIRECT is not supported by the storage backend.
+func (s *SBRAgent) initializeFilesystemModeDevices() error {
+	heartbeatDevice, err := openWithDirectOrReopen(s.heartbeatDevicePath, s.ioTimeout,
+		logger.WithName("heartbeat-device"))
+	if err != nil {
+		return fmt.Errorf("failed to open heartbeat device %s: %w",
+			s.heartbeatDevicePath, err)
+	}
+
+	fenceDevice, err := openWithDirectOrReopen(s.fenceDevicePath, s.ioTimeout, logger.WithName("fence-device"))
+	if err != nil {
+		return fmt.Errorf("failed to open fence device %s: %w", s.fenceDevicePath, err)
 	}
 
 	s.heartbeatDevice = heartbeatDevice
@@ -1246,7 +1307,13 @@ func (s *SBRAgent) readPeerHeartbeat(peerNodeID uint16) error {
 	}
 	n, err := s.heartbeatDevice.ReadAt(slotData, slotOffset)
 	if err != nil {
-		// Increment SBR I/O errors counter for read failures
+		// EOF means the slot has never been written (file too short).
+		// Treat it the same as an empty slot — not an I/O failure.
+		if errors.Is(err, io.EOF) {
+			logger.V(2).Info("Peer slot beyond file end", "peerNodeID", peerNodeID)
+			return nil
+		}
+		// Increment SBR I/O errors counter for real read failures
 		sbrIOErrorsCounter.Inc()
 		s.incrementFailureCount("heartbeat")
 		return fmt.Errorf("failed to read peer %d heartbeat from offset %d: %w", peerNodeID, slotOffset, err)
@@ -1829,6 +1896,9 @@ func (s *SBRAgent) cleanOwnFenceSlotIfPresent(logger logr.Logger) error {
 	}
 	n, err := s.fenceDevice.ReadAt(headerBuf, slotOffset)
 	if err != nil {
+		if errors.Is(err, io.EOF) {
+			return nil // slot not yet written
+		}
 		return fmt.Errorf("failed to read header from own slot %d at offset %d: %w", s.nodeID, slotOffset, err)
 	}
 	if n < sbdprotocol.SBD_HEADER_SIZE {
@@ -2209,6 +2279,9 @@ func (s *SBRAgent) readOwnSlotForFenceMessage() error {
 	}
 	n, err := s.fenceDevice.ReadAt(slotData, slotOffset)
 	if err != nil {
+		if errors.Is(err, io.EOF) {
+			return nil // slot not yet written
+		}
 		return fmt.Errorf("failed to read own slot %d from offset %d: %w", s.nodeID, slotOffset, err)
 	}
 
@@ -2389,9 +2462,9 @@ func runPreflightChecks(watchdogPath, sbrDevicePath, nodeName string, nodeID uin
 		logger.Info("All pre-flight checks passed successfully")
 		return nil
 	} else if watchdogErr == nil {
-		return fmt.Errorf("pre-flight checks failed: SBR device is not available")
+		return fmt.Errorf("pre-flight checks failed: SBR device is not available: %w", sbrErr)
 	} else if sbrErr == nil {
-		return fmt.Errorf("pre-flight checks failed: watchdog device is not available")
+		return fmt.Errorf("pre-flight checks failed: watchdog device is not available: %w", watchdogErr)
 	} else {
 		return fmt.Errorf(
 			"pre-flight checks failed: both watchdog device and SBR device are inaccessible. Watchdog error: %v, SBR error: %v",
@@ -2736,14 +2809,79 @@ func (s *SBRAgent) addSBRRemediationController() error {
 	return nil
 }
 
-// runInit initializes a block device with a V1 superblock.
-// It opens the device, checks its size, and calls blockformat.InitDevice.
+// runInit detects whether devicePath is a directory (filesystem mode) or a
+// file/block device (block mode) and runs the appropriate initialization.
+//
+// Filesystem mode (directory): creates empty heartbeat and fence device files.
+// Block mode (file/device): writes a V1 superblock.
+//
 // Returns nil on success (including idempotent no-op).
 func runInit(devicePath string, ioTimeout time.Duration, log logr.Logger) error {
 	if devicePath == "" {
 		return fmt.Errorf("--%s is required in init mode", agent.FlagSBRDevice)
 	}
 
+	info, err := os.Stat(devicePath)
+	if err != nil {
+		return fmt.Errorf("cannot stat %q: %w", devicePath, err)
+	}
+
+	if info.IsDir() {
+		return runFSInit(devicePath, log)
+	}
+
+	return runBlockInit(devicePath, ioTimeout, log)
+}
+
+// runFSInit creates the heartbeat and fence device files for filesystem mode.
+// Each file is pre-allocated to SBD_MAX_NODES * SBD_SLOT_SIZE bytes so that
+// reads of any valid slot return zero-filled data rather than EOF.
+// Node mapping is created by the agent on first startup, not by init.
+func runFSInit(mountPath string, log logr.Logger) error {
+	if mountPath == "" {
+		return fmt.Errorf("mount path cannot be empty")
+	}
+	heartbeatPath := filepath.Join(mountPath, agent.SharedStorageSBRDeviceFile)
+	fencePath := heartbeatPath + agent.SharedStorageFenceDeviceSuffix
+
+	requiredSize := int64(sbdprotocol.SBD_MAX_NODES) * int64(sbdprotocol.SBD_SLOT_SIZE)
+
+	for _, p := range []string{heartbeatPath, fencePath} {
+		info, err := os.Stat(p)
+		switch {
+		case err == nil:
+			if !info.Mode().IsRegular() {
+				return fmt.Errorf("device path %q exists but is not a regular file (mode %s)", p, info.Mode())
+			}
+			if info.Size() >= requiredSize {
+				log.Info("Device file already exists with sufficient size", "path", p, "size", info.Size())
+				continue
+			}
+			log.Info("Device file exists but is too small, extending", "path", p, "currentSize", info.Size(), "requiredSize", requiredSize)
+		case !os.IsNotExist(err):
+			return fmt.Errorf("failed to stat device file %q: %w", p, err)
+		}
+		f, err := os.OpenFile(p, os.O_CREATE|os.O_WRONLY, 0664)
+		if err != nil {
+			return fmt.Errorf("failed to create device file %q: %w", p, err)
+		}
+		if err := f.Truncate(requiredSize); err != nil {
+			f.Close()
+			return fmt.Errorf("failed to pre-allocate device file %q to %d bytes: %w", p, requiredSize, err)
+		}
+		if err := f.Close(); err != nil {
+			return fmt.Errorf("failed to close device file %q: %w", p, err)
+		}
+		log.Info("Created device file", "path", p, "size", requiredSize)
+	}
+
+	log.Info("Filesystem mode device initialization complete", "mountPath", mountPath)
+	return nil
+}
+
+// runBlockInit initializes a block device with a V1 superblock.
+// It opens the device, checks its size, and calls blockformat.InitDevice.
+func runBlockInit(devicePath string, ioTimeout time.Duration, log logr.Logger) error {
 	// Use O_DIRECT + O_SYNC (OpenWithTimeout) for init. Concurrent init Jobs
 	// on different nodes can share the same RWX block device. O_DIRECT avoids
 	// relying on the local page cache when checking the existing superblock.
@@ -2792,15 +2930,16 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Handle --init mode: initialize block device and exit immediately.
+	// Handle --init mode: initialize devices and exit immediately.
+	// Auto-detects filesystem mode (directory) vs block mode (file/device).
 	// This runs before any Kubernetes client setup, watchdog, or agent logic.
 	if *initMode {
-		logger.Info("Running in init mode")
+		logger.Info("Running in init mode", "path", *sbrDevice)
 		if err := runInit(*sbrDevice, *ioTimeout, logger); err != nil {
-			logger.Error(err, "Block device initialization failed")
+			logger.Error(err, "Device initialization failed")
 			os.Exit(1)
 		}
-		logger.Info("Block device initialization complete")
+		logger.Info("Device initialization complete")
 		os.Exit(0)
 	}
 

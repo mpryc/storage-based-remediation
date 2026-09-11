@@ -17,6 +17,7 @@ limitations under the License.
 package blockdevice
 
 import (
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -25,6 +26,7 @@ import (
 	"time"
 
 	"github.com/go-logr/logr"
+	"golang.org/x/sys/unix"
 )
 
 // syncOpener opens block devices without O_DIRECT for unit tests.
@@ -651,52 +653,237 @@ func BenchmarkWriteAt(b *testing.B) {
 	}
 }
 
-func TestOpenBuffered(t *testing.T) {
+func TestFadviseInvokedOnBufferedDevice(t *testing.T) {
 	devicePath, cleanup := setupTestDevice(t, 4096)
 	defer cleanup()
 
-	// OpenBuffered should work the same as OpenWithTimeout but use
-	// bufferedOpener (no O_DIRECT). Since unit tests already override
-	// DeviceOpener, we verify the function signature and I/O work.
-	device, err := OpenBuffered(devicePath, 5*time.Second, logr.Discard())
+	device, err := openWithOpener(devicePath, 5*time.Second, logr.Discard(), BufferedDeviceOpener)
 	if err != nil {
-		t.Fatalf("OpenBuffered failed: %v", err)
+		t.Fatalf("openWithOpener (buffered) failed: %v", err)
 	}
 	defer device.Close()
 
-	// Write and read back
-	testData := []byte("buffered test data")
-	n, err := device.WriteAt(testData, 0)
-	if err != nil {
-		t.Fatalf("WriteAt failed: %v", err)
-	}
-	if n != len(testData) {
-		t.Errorf("expected to write %d bytes, wrote %d", len(testData), n)
+	// Manually set fadvise as ReopenDevice does in production
+	device.fadvise = unix.Fadvise
+
+	// Inject a recording fadvise to verify ReadAt calls it
+	var calls []fadviseCall
+	device.fadvise = func(fd int, offset int64, length int64, advice int) error {
+		calls = append(calls, fadviseCall{fd: fd, offset: offset, length: length, advice: advice})
+		return nil
 	}
 
-	readBuf := make([]byte, len(testData))
-	n, err = device.ReadAt(readBuf, 0)
-	if err != nil {
+	// Write then read — fadvise should be called on the read
+	testData := []byte("hello")
+	if _, err := device.WriteAt(testData, 100); err != nil {
+		t.Fatalf("WriteAt failed: %v", err)
+	}
+
+	buf := make([]byte, len(testData))
+	if _, err := device.ReadAt(buf, 100); err != nil {
 		t.Fatalf("ReadAt failed: %v", err)
 	}
-	if string(readBuf[:n]) != string(testData) {
-		t.Errorf("read data mismatch: expected %q, got %q", testData, readBuf[:n])
+
+	if len(calls) != 1 {
+		t.Fatalf("expected 1 fadvise call, got %d", len(calls))
+	}
+
+	c := calls[0]
+
+	// Verify the advice is FADV_DONTNEED
+	if c.advice != unix.FADV_DONTNEED {
+		t.Errorf("fadvise advice: got %d, want FADV_DONTNEED (%d)", c.advice, unix.FADV_DONTNEED)
+	}
+
+	// Verify the range is page-aligned
+	pageSize := int64(os.Getpagesize())
+	if c.offset%pageSize != 0 {
+		t.Errorf("fadvise offset %d is not page-aligned (page size %d)", c.offset, pageSize)
+	}
+	if c.length%pageSize != 0 {
+		t.Errorf("fadvise length %d is not page-aligned (page size %d)", c.length, pageSize)
+	}
+	// The aligned range must cover the original [100, 105) range
+	if c.offset > 100 {
+		t.Errorf("fadvise offset %d does not cover requested offset 100", c.offset)
+	}
+	if c.offset+c.length < 105 {
+		t.Errorf("fadvise range [%d, %d) does not cover requested end 105",
+			c.offset, c.offset+c.length)
 	}
 }
 
-func TestOpenBufferedValidation(t *testing.T) {
-	// Verify OpenBuffered shares the same validation as OpenWithTimeout
-	_, err := OpenBuffered("", 5*time.Second, logr.Discard())
+func TestOpenWithTimeoutDoesNotInvokeFadvise(t *testing.T) {
+	devicePath, cleanup := setupTestDevice(t, 4096)
+	defer cleanup()
+
+	device, err := OpenWithTimeout(devicePath, 5*time.Second, logr.Discard())
+	if err != nil {
+		t.Fatalf("OpenWithTimeout failed: %v", err)
+	}
+	defer device.Close()
+
+	// O_DIRECT devices must have fadvise=nil so ReadAt skips cache eviction
+	if device.fadvise != nil {
+		t.Fatal("expected fadvise=nil for OpenWithTimeout device")
+	}
+
+	// Verify ReadAt works without fadvise (no panic, no error)
+	buf := make([]byte, 10)
+	if _, err := device.ReadAt(buf, 0); err != nil {
+		t.Fatalf("ReadAt failed on non-buffered device: %v", err)
+	}
+}
+
+func TestFadviseContinuesOnError(t *testing.T) {
+	devicePath, cleanup := setupTestDevice(t, 4096)
+	defer cleanup()
+
+	device, err := openWithOpener(devicePath, 5*time.Second, logr.Discard(), BufferedDeviceOpener)
+	if err != nil {
+		t.Fatalf("openWithOpener (buffered) failed: %v", err)
+	}
+	defer device.Close()
+
+	// Write data first
+	testData := []byte("test data")
+	if _, err := device.WriteAt(testData, 0); err != nil {
+		t.Fatalf("WriteAt failed: %v", err)
+	}
+
+	// Inject a failing fadvise — read should still succeed
+	device.fadvise = func(fd int, offset int64, length int64, advice int) error {
+		return fmt.Errorf("simulated fadvise failure")
+	}
+
+	buf := make([]byte, len(testData))
+	n, err := device.ReadAt(buf, 0)
+	if err != nil {
+		t.Fatalf("ReadAt should succeed even when fadvise fails: %v", err)
+	}
+	if string(buf[:n]) != string(testData) {
+		t.Errorf("read data mismatch: expected %q, got %q", testData, buf[:n])
+	}
+}
+
+func TestPageAlignedRange(t *testing.T) {
+	pageSize := int64(os.Getpagesize())
+
+	tests := []struct {
+		name       string
+		off        int64
+		length     int64
+		wantOff    int64
+		wantLength int64
+		wantErr    bool
+	}{
+		{
+			name:       "already aligned",
+			off:        0,
+			length:     pageSize,
+			wantOff:    0,
+			wantLength: pageSize,
+		},
+		{
+			name:       "offset mid-page",
+			off:        100,
+			length:     512,
+			wantOff:    0,
+			wantLength: pageSize,
+		},
+		{
+			name:       "spans two pages",
+			off:        pageSize - 10,
+			length:     20,
+			wantOff:    0,
+			wantLength: 2 * pageSize,
+		},
+		{
+			name:       "zero length at page boundary",
+			off:        pageSize,
+			length:     0,
+			wantOff:    pageSize,
+			wantLength: 0,
+		},
+		{
+			name:       "large offset",
+			off:        pageSize*100 + 123,
+			length:     1,
+			wantOff:    pageSize * 100,
+			wantLength: pageSize,
+		},
+		{
+			name:    "negative length",
+			off:     0,
+			length:  -1,
+			wantErr: true,
+		},
+		{
+			name:    "overflow off+length",
+			off:     1<<62 + 1,
+			length:  1<<62 + 1,
+			wantErr: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			gotOff, gotLen, err := pageAlignedRange(tt.off, tt.length)
+
+			if tt.wantErr {
+				if err == nil {
+					t.Fatal("expected error, got nil")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+
+			if gotOff != tt.wantOff {
+				t.Errorf("offset: got %d, want %d", gotOff, tt.wantOff)
+			}
+			if gotLen != tt.wantLength {
+				t.Errorf("length: got %d, want %d", gotLen, tt.wantLength)
+			}
+			// Invariant: aligned range must cover original range
+			if gotOff > tt.off {
+				t.Errorf("aligned offset %d > original offset %d", gotOff, tt.off)
+			}
+			if tt.length > 0 && gotOff+gotLen < tt.off+tt.length {
+				t.Errorf("aligned end %d < original end %d", gotOff+gotLen, tt.off+tt.length)
+			}
+			// Invariant: both must be page-aligned
+			if gotOff%pageSize != 0 {
+				t.Errorf("aligned offset %d not page-aligned", gotOff)
+			}
+			if gotLen > 0 && gotLen%pageSize != 0 {
+				t.Errorf("aligned length %d not page-aligned", gotLen)
+			}
+		})
+	}
+}
+
+type fadviseCall struct {
+	fd     int
+	offset int64
+	length int64
+	advice int
+}
+
+func TestBufferedOpenerValidation(t *testing.T) {
+	// Verify buffered opener shares the same validation as OpenWithTimeout
+	_, err := openWithOpener("", 5*time.Second, logr.Discard(), BufferedDeviceOpener)
 	if err == nil {
 		t.Error("expected error for empty path")
 	}
 
-	_, err = OpenBuffered("/nonexistent", 0, logr.Discard())
+	_, err = openWithOpener("/nonexistent", 0, logr.Discard(), BufferedDeviceOpener)
 	if err == nil {
 		t.Error("expected error for zero timeout")
 	}
 
-	_, err = OpenBuffered("/nonexistent", 500*time.Millisecond, logr.Discard())
+	_, err = openWithOpener("/nonexistent", 500*time.Millisecond, logr.Discard(), BufferedDeviceOpener)
 	if err == nil {
 		t.Error("expected error for timeout too short")
 	}
@@ -815,5 +1002,144 @@ func TestOpenWithTimeout(t *testing.T) {
 
 			_ = device.Close()
 		})
+	}
+}
+
+// TestValidateBlockModeStorage_ODirectNotSet verifies that the F_GETFL check
+// detects when O_DIRECT is not set on the file descriptor.
+func TestValidateBlockModeStorage_ODirectNotSet(t *testing.T) {
+	devicePath, cleanup := setupTestDevice(t, 4096)
+	defer cleanup()
+
+	// Open without O_DIRECT — simulates a code bug where the open path
+	// accidentally omits O_DIRECT.
+	dev, err := openWithOpener(devicePath, 5*time.Second, logr.Discard(), BufferedDeviceOpener)
+	if err != nil {
+		t.Fatalf("openWithOpener (buffered) failed: %v", err)
+	}
+	defer dev.Close()
+
+	err = DefaultStorageChecker.ValidateBlockModeStorage(dev.File(), devicePath)
+	if err == nil {
+		t.Fatal("should reject fd without O_DIRECT")
+	}
+	if !strings.Contains(err.Error(), "O_DIRECT is not set") {
+		t.Fatalf("error should mention O_DIRECT, got: %v", err)
+	}
+}
+
+// TestBlockModeFilesystemUnsupported_BlacklistedTypes verifies that the
+// production blocklist rejects NFS, CIFS, and FUSE filesystem types.
+func TestBlockModeFilesystemUnsupported_BlacklistedTypes(t *testing.T) {
+	tests := []struct {
+		name     string
+		fsType   int64
+		wantName string
+	}{
+		{"NFS", int64(unix.NFS_SUPER_MAGIC), "NFS"},
+		{"CIFS", int64(unix.CIFS_SUPER_MAGIC), "CIFS"},
+		{"FUSE", int64(unix.FUSE_SUPER_MAGIC), "FUSE"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			name, unsupported := blockModeFilesystemUnsupported(tt.fsType)
+			if !unsupported {
+				t.Fatalf("expected %s (0x%x) to be unsupported", tt.name, tt.fsType)
+			}
+			if !strings.Contains(name, tt.wantName) {
+				t.Fatalf("expected name to contain %q, got %q", tt.wantName, name)
+			}
+		})
+	}
+}
+
+// TestBlockModeFilesystemUnsupported_NotBlacklistedTypes verifies that
+// filesystem types not in the blocklist are allowed through. This does not
+// imply these filesystems are validated for block-mode correctness.
+func TestBlockModeFilesystemUnsupported_NotBlacklistedTypes(t *testing.T) {
+	tests := []struct {
+		name   string
+		fsType int64
+	}{
+		{"ext4", int64(unix.EXT4_SUPER_MAGIC)},
+		{"xfs", int64(unix.XFS_SUPER_MAGIC)},
+		{"tmpfs", int64(unix.TMPFS_MAGIC)},
+		{"btrfs", int64(unix.BTRFS_SUPER_MAGIC)},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, unsupported := blockModeFilesystemUnsupported(tt.fsType)
+			if unsupported {
+				t.Fatalf("%s (0x%x) should not be rejected", tt.name, tt.fsType)
+			}
+		})
+	}
+}
+
+// TestValidateBlockModeStorage_SuccessfulPath verifies that the full checker
+// accepts a file descriptor that has O_DIRECT set and is backed by a
+// compatible filesystem. This exercises the sequential F_GETFL → fstatfs path.
+func TestValidateBlockModeStorage_SuccessfulPath(t *testing.T) {
+	devicePath, cleanup := setupTestDevice(t, 4096)
+	defer cleanup()
+
+	// Open with O_DIRECT via the production directOpener path.
+	// On tmpfs the fstatfs check will see TMPFS_MAGIC, which is not in
+	// the blocklist, so the full checker should accept it.
+	//
+	// Note: DeviceOpener is overridden to syncOpener in test init(), so
+	// we call directOpener explicitly to get a real O_DIRECT fd.
+	do := directOpener{}
+	f, err := do.Open(devicePath)
+	if err != nil {
+		t.Skipf("O_DIRECT not supported on test filesystem, skipping: %v", err)
+	}
+	defer f.Close()
+
+	err = DefaultStorageChecker.ValidateBlockModeStorage(f, devicePath)
+	if err != nil {
+		t.Fatalf("expected successful validation, got: %v", err)
+	}
+}
+
+// TestIsDirectIOUnsupportedFS_LocalFS verifies that IsDirectIOUnsupportedFS
+// returns an empty name for local filesystems (tmpfs, ext4, xfs) that are not
+// on the blocklist.
+func TestIsDirectIOUnsupportedFS_LocalFS(t *testing.T) {
+	devicePath, cleanup := setupTestDevice(t, 4096)
+	defer cleanup()
+
+	f, err := os.Open(devicePath)
+	if err != nil {
+		t.Fatalf("failed to open test device: %v", err)
+	}
+	defer f.Close()
+
+	fsName, err := IsDirectIOUnsupportedFS(f)
+	if err != nil {
+		t.Fatalf("IsDirectIOUnsupportedFS failed: %v", err)
+	}
+	if fsName != "" {
+		t.Errorf("expected empty fsName for local filesystem, got %q", fsName)
+	}
+}
+
+// TestIsDirectIOUnsupportedFS_ClosedFd verifies that IsDirectIOUnsupportedFS
+// returns an error when called with a closed file descriptor.
+func TestIsDirectIOUnsupportedFS_ClosedFd(t *testing.T) {
+	devicePath, cleanup := setupTestDevice(t, 4096)
+	defer cleanup()
+
+	f, err := os.Open(devicePath)
+	if err != nil {
+		t.Fatalf("failed to open test device: %v", err)
+	}
+	f.Close()
+
+	_, err = IsDirectIOUnsupportedFS(f)
+	if err == nil {
+		t.Fatal("expected error for closed fd")
 	}
 }
