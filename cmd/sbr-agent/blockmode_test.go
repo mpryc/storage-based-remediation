@@ -28,6 +28,7 @@ import (
 
 	"github.com/medik8s/storage-based-remediation/internal/blockdevice"
 	"github.com/medik8s/storage-based-remediation/internal/blockformat"
+	"github.com/medik8s/storage-based-remediation/internal/controller"
 	"github.com/medik8s/storage-based-remediation/internal/sbdprotocol"
 )
 
@@ -555,6 +556,44 @@ func TestSlotOffset_FilesystemMode(t *testing.T) {
 		if got != tc.want {
 			t.Errorf("slotOffset(%d) = %d, want %d", tc.nodeID, got, tc.want)
 		}
+	}
+}
+
+// TestSlotOffsetAgreesWithReconciler is the cross-component guard for the drift that broke block
+// mode: the agent and the remediation reconciler each keep their own copy of the slot arithmetic,
+// and the reconciler is handed the agent's own region-relative OffsetDevice adapters, so the two
+// copies must resolve every node to the same byte.
+//
+// They did not. The agent was changed to the packed block-mode base (nodeID-1) to fix the slot-255
+// region overflow; the reconciler's copy was left on nodeID. The reconciler then wrote the fence
+// pill one slot past where the victim reads it, and read liveness one slot past where the victim
+// writes it — and since a zeroed neighbouring slot fails to unmarshal, which is treated as "node
+// stopped", fencing was reported complete while the victim was still alive and writing.
+//
+// Neither side's own unit tests could catch that: each was self-consistent. Only comparing the two
+// does. If you change one slotOffset, this fails until you change the other.
+func TestSlotOffsetAgreesWithReconciler(t *testing.T) {
+	for _, blockMode := range []bool{false, true} {
+		name := "filesystem-mode"
+		if blockMode {
+			name = "block-mode"
+		}
+		t.Run(name, func(t *testing.T) {
+			agent := &SBRAgent{blockMode: blockMode}
+			r := &controller.SBRRemediationReconciler{}
+			if blockMode {
+				r.SetBlockMode(true, blockformat.BlockSlotSize,
+					make([]byte, blockformat.BlockSlotSize), make([]byte, blockformat.BlockSlotSize))
+			}
+
+			for nodeID := uint16(1); nodeID <= sbdprotocol.SBD_MAX_NODES; nodeID++ {
+				want := agent.slotOffset(nodeID)
+				if got := r.SlotOffset(nodeID); got != want {
+					t.Fatalf("node %d: reconciler SlotOffset = %d, agent slotOffset = %d; "+
+						"the controller would target the wrong slot", nodeID, got, want)
+				}
+			}
+		})
 	}
 }
 
