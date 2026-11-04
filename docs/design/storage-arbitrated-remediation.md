@@ -82,7 +82,7 @@ Every requested lifecycle below assumes a running eligible peer with API access.
 | 1 | Healthy storage and API | Probe storage, feed the watchdog, and report storage healthy. | Probe results describe the selected backend, not every workload volume. |
 | 2 | Cluster-wide API outage with healthy storage | Continue watchdog feeding. Do not reboot for API loss alone. | Other Kubernetes and workload controllers have independent behavior. |
 | 3 | Broad storage outage with reachable API | Report unhealthy after storage grace. Await an authorized NHC request. Running peers reconcile through the API despite their own probe failures. | NHC thresholds can block new requests. Delayed reports and prior commitments prevent a zero-reboot guarantee. Peer startup can remain blocked by CSI. |
-| 4 | Storage and API unavailable | After both grace periods, perform at most one autonomous reset in the unresolved outage period. Skip cleanup for that attempt and preserve any retained requested owner. | Unknown or exhausted budget fails closed. Recovery of Pods elsewhere is not guaranteed. |
+| 4 | Storage and API unavailable | After both grace periods, perform at most one autonomous reset in the unresolved outage epoch. Skip cleanup for that attempt and preserve any retained requested owner. | Unknown or exhausted budget fails closed. Recovery of Pods elsewhere is not guaranteed. |
 | 5 | One node loses API or cluster-network access | Keep feeding while its storage remains healthy. | Configure NHC for the storage condition only. |
 | 6 | One node loses storage with API available | NHC creates a request. A peer offers it. The target accepts and resets. After `BootEnded`, apply OutOfService and observe cleanup until completion or the deadline. | Unresolved execution or unavailable evidence can block progress. Continuing isolation is not guaranteed. |
 | 7 | Kernel panic, host freeze, or power loss | A qualified armed watchdog can reset a powered host that stops feeding it. | It cannot restore power. A dead node cannot publish the storage condition. Hard-dead failover is outside the base policy. |
@@ -95,7 +95,7 @@ Every requested lifecycle below assumes a running eligible peer with API access.
 | 14 | One node uses several storage backends | Deferred. Add multiple probes and a health aggregation policy. | See Section 6. |
 | 15 | Stuck or terminating workload Pod | Use OutOfService only. At the fixed deadline, finish the policy with incomplete or unknown cleanup recorded separately. Restore owned restrictions during deletion. | Workload finalizers cannot retain execution indefinitely. Workload recovery and safe rejoin are not guaranteed. |
 | 16 | Host journal unavailable or recovered | Preserve known commitments and reconcile trusted API records. Unknown autonomous history blocks fresh reset allowance. Peers continue independent API work. | Missing history cannot prove an unused budget. Ordered boot evidence can still resolve a known accepted execution. |
-| 17 | Repeated remediation on persistent failure | Enforce the durable node-level outage budget and single local agent. Later remediation CRs wait for ownership release and cannot bypass an unresolved outage period. | Exact requested-reset and rearm values require qualification. |
+| 17 | Repeated remediation on persistent failure | Enforce the durable node-level outage budget and single local agent. Later remediation CRs wait for ownership release and cannot bypass an unresolved outage epoch. | Exact requested-reset and rearm values require qualification. |
 
 ### 5.2. Components and ownership
 
@@ -143,15 +143,15 @@ All state writers use conditional updates with `resourceVersion`. After a confli
 
 #### One authoritative execution record
 
-Reuse `sbr.medik8s.io/remediation-owner` on the Node. Its versioned JSON contains one current execution, a node-level budget, separate restriction ownership, and a coordination revision. CR status reports this record. It does not independently authorize execution.
+Introduce `medik8s.io/sbr-node-remediation-state` on the Node. SBR defines no such annotation today, so this is a new key rather than a reused one. Its versioned JSON contains one current execution, a node-level budget, separate restriction ownership, and a coordination revision. CR status reports this record. It does not independently authorize execution.
 
-The remediation CR UID identifies a requested attempt. No separate grant ID or ownership UUID is required. The request permanently binds one Node UID and one `beforeBootID`. A changed generation, new configuration, or later boot cannot give that CR another attempt.
+The remediation CR UID identifies a requested attempt. No separate grant ID or ownership UUID is required. The request permanently binds one Node UID and one `initialBootID`. A changed generation, new configuration, or later boot cannot give that CR another attempt.
 
 An illustrative record is:
 
 ```json
 {
-  "version": 1,
+  "schemaVersion": 1,
   "nodeUID": "node-uid",
   "coordinationRevision": 12,
   "execution": {
@@ -159,13 +159,13 @@ An illustrative record is:
     "requestName": "worker-0",
     "requestUID": "request-uid",
     "configUID": "config-uid",
-    "beforeBootID": "boot-a",
+    "initialBootID": "boot-a",
     "phase": "Accepted",
     "observedBootID": "",
     "cleanupClosed": false
   },
-  "budget": {
-    "phase": "Known",
+  "resetBudget": {
+    "historyState": "Known",
     "outageEpoch": "outage-id",
     "requestedAttempts": ["request-uid"],
     "autonomousAttempts": []
@@ -189,7 +189,7 @@ An illustrative record is:
 
 The counter does not replace `resourceVersion` preconditions or identify a particular request. It requires no retained list of deleted CR UIDs. The release ordering below makes earlier claims conflict with deletion.
 
-The budget fields illustrate retained attempt identities, not an unlimited event log. Retain unresolved attempts and summarize older accounting only under the qualified rearm policy. Missing budget history is `Unknown`, not an unused allowance. Initialize it only from proved first installation or complete trusted history. On the first accepted attempt of a known idle budget, install the locally reserved epoch in the same acceptance update. Otherwise, require the existing epoch to match.
+The budget fields illustrate retained attempt identities, not an unlimited event log. Retain unresolved attempts and summarize older accounting only under the qualified rearm policy. Missing budget history is `Unproven`, not an unused allowance. Initialize it only from proved first installation or complete trusted history. On the first accepted attempt of a known idle budget, install the locally reserved epoch in the same acceptance update. Otherwise, require the existing epoch to match.
 
 The only execution transitions are:
 
@@ -271,7 +271,7 @@ Extend the existing optional `StorageBasedRemediationConfig.spec.sharedStorageVo
 |---|---|---|---|
 | `sharedStorageVolumeMode` | `Filesystem` | `Filesystem`, `Block`, or `BlockPerNode` | Existing shared Filesystem, existing shared Block, or one private Block probe per selected node. |
 | `storageUnhealthyGracePeriod` | `15s` in `BlockPerNode` | Duration from `0s` through `300s`. Valid only in `BlockPerNode`. | Continuous probe failure required before storage becomes unhealthy. |
-| `totalOutageGracePeriod` | `60s` in `BlockPerNode` | Duration from `0s` through `1h`. Valid only in `BlockPerNode`. | Continuous API unavailability required while storage is already unhealthy before autonomous commitment. |
+| `combinedOutageGracePeriod` | `60s` in `BlockPerNode` | Duration from `0s` through `1h`. Valid only in `BlockPerNode`. | Continuous API unavailability required while storage is already unhealthy before autonomous commitment. |
 
 The duration defaults are proposed values for `BlockPerNode`. They do not replace the existing shared-storage detection threshold. An omitted volume mode remains equivalent to explicit `Filesystem`. Explicit `Block` continues to select shared storage.
 
@@ -294,7 +294,7 @@ type StorageBasedRemediationConfigSpec struct {
 	StorageUnhealthyGracePeriod *metav1.Duration `json:"storageUnhealthyGracePeriod,omitempty"`
 
 	// +optional
-	TotalOutageGracePeriod *metav1.Duration `json:"totalOutageGracePeriod,omitempty"`
+	CombinedOutageGracePeriod *metav1.Duration `json:"combinedOutageGracePeriod,omitempty"`
 }
 
 func (s *StorageBasedRemediationConfigSpec) IsBlockPerNodeMode() bool {
@@ -351,9 +351,9 @@ Current production code does not enforce configuration overlap consistently. The
 
 The configuration controller must reconcile assignments after admission, including concurrent creates and later label changes. Missing, conflicting, unreadable, or ambiguous effective configuration blocks preparation, commitment, and every new destructive action. An already committed action continues only with the configuration already recorded and retained for that request.
 
-One host process holds permission to perform local actions through a non-blocking exclusive `flock` on `/var/lib/medik8s/state/sbr-executor.lock`. The lock file is separate from the atomically replaced journal and is never unlinked during operation. Acquire it before opening or arming the watchdog, loading mutable journal state, or accepting an offer. Hold it for the local agent's lifetime.
+One host process holds permission to perform local actions through a non-blocking exclusive `flock` on `/var/lib/medik8s/state/sbr-local-agent.lock`. The lock file is separate from the atomically replaced journal and is never unlinked during operation. Acquire it before opening or arming the watchdog, loading mutable journal state, or accepting an offer. Hold it for the local agent's lifetime.
 
-Failure or unsupported locking sets `ExecutorConflict`. That process performs no watchdog or journal writes, but its eligible peer controller can continue API reconciliation. Never break the lock by Pod UID, Lease expiry, peer replacement, or age. Never disarm a watchdog opened by an unknown process.
+Failure or unsupported locking sets `LocalAgentConflict`. That process performs no watchdog or journal writes, but its eligible peer controller can continue API reconciliation. Never break the lock by Pod UID, Lease expiry, peer replacement, or age. Never disarm a watchdog opened by an unknown process.
 
 Set DaemonSet `maxSurge: 0` and `maxUnavailable: 1` explicitly. These settings do not replace the host lock. Assignment checks select the configuration. Node ownership selects the request. Neither selects the process that holds the watchdog.
 
@@ -453,7 +453,7 @@ Update the condition through a strategic merge patch or an optimistic-lock read-
 | Unhealthy | Reachable, valid offered request | Reserve the local budget, conditionally accept, persist the latch, and execute the requested reset. |
 | Unhealthy | Unavailable within total-outage grace | Feed the watchdog while the grace runs. |
 | Unhealthy | Unavailable through total-outage grace | If the local outage budget permits, persist an autonomous attempt and execute one local reset operation. Skip cleanup. |
-| Unhealthy | Unavailable, local outage budget exhausted or unknown | Record exhaustion when possible and keep feeding. Do not reset again until the outage period is safely reset to permit another reset. |
+| Unhealthy | Unavailable, local outage budget exhausted or unknown | Record exhaustion when possible and keep feeding. Do not reset again until the outage epoch is safely reset to permit another reset. |
 | Any state | Detect-only enabled, no prior commitment | Report observations. Do not perform remediation actions. |
 
 Acceptance requires unhealthy local storage and matching request UID, Node UID, configuration UID, and initial boot ID. The local budget and API budget must permit acceptance. Once the Node record becomes `Accepted`, later health recovery cannot cancel that decision.
@@ -466,7 +466,7 @@ A successful empty result or `NotFound` means the endpoint is reachable. However
 
 Connection failures and network deadlines contribute to API unavailability. For this policy, a received `429` or `5xx` means the configured endpoint is reachable. It cannot authorize a request. Keep feeding and reset the API-unavailability interval for those responses. Credential, certificate-validation, and client-configuration errors report degradation instead of triggering autonomous remediation. Neither a failed Node status write nor a missing remediation CR alone establishes API unavailability.
 
-Start `totalOutageGracePeriod` when storage is unhealthy and API access is unavailable together. Reset that interval if storage recovers or the API becomes reachable. Its duration follows the storage grace rather than replacing it.
+Start `combinedOutageGracePeriod` when storage is unhealthy and API access is unavailable together. Reset that interval if storage recovers or the API becomes reachable. Its duration follows the storage grace rather than replacing it.
 
 ```mermaid
 flowchart TD
@@ -519,9 +519,9 @@ Use the proposed common envelope below. These names specify the required API, no
 | Diagnostic reboot records | `Document.Reboots` | `reboots` |
 | Diagnostic samples and events | `Document.IO`, `Document.Conditions`, `Document.Events` | `io`, `conditions`, `events` |
 
-Use four SBR keys inside `agent.extra`: `sbrStateVersion`, `activeAttempt`, `resetLedger`, and `outageState`. Set `sbrStateVersion` to the string `"1"`. Encode each object or array as a JSON string because `Agent.Extra` has type `map[string]string`. SBR validates and changes these records. Common preserves them without interpreting their contents.
+Use four SBR keys inside `agent.extra`: `schemaVersion`, `activeAttempt`, `resetBudget`, and `outageState`. Set `schemaVersion` to the string `"1"`. Encode each object or array as a JSON string because `Agent.Extra` has type `map[string]string`. SBR validates and changes these records. Common preserves them without interpreting their contents.
 
-The requested action identity is `(StorageBasedRemediation UID, Node UID)`. Use the request UID as its `attemptID`. Bind it permanently to the Node UID, configuration UID, and `beforeBootID`. Generation changes and configuration replacement do not permit another attempt for that request. A new request UID cannot bypass the node-level budget.
+The requested action identity is `(StorageBasedRemediation UID, Node UID)`. Use the request UID as its `attemptID`. Bind it permanently to the Node UID, configuration UID, and `initialBootID`. Generation changes and configuration replacement do not permit another attempt for that request. A new request UID cannot bypass the node-level budget.
 
 The Node execution record is authoritative for `Offered`, `Accepted`, `Cancelled`, and `BootEnded`. A journal entry cannot create acceptance or reverse cancellation. Retain local records for budget accounting and execution recovery. They do not create another ownership or release protocol.
 
@@ -544,10 +544,10 @@ The following fragment shows a committed requested attempt. Common also records 
     "shutdown": "running",
     "fenceLatched": true,
     "extra": {
-      "sbrStateVersion": "1",
-      "activeAttempt": "{\"attemptID\":\"request-uid\",\"source\":\"NHC\",\"requestUID\":\"request-uid\",\"nodeUID\":\"node-uid\",\"configUID\":\"config-uid\",\"beforeBootID\":\"11111111-1111-4111-8111-111111111111\",\"outageEpoch\":\"epoch-uuid\",\"phase\":\"Committed\"}",
-      "resetLedger": "[{\"attemptID\":\"request-uid\",\"source\":\"NHC\",\"requestUID\":\"request-uid\",\"nodeUID\":\"node-uid\",\"beforeBootID\":\"11111111-1111-4111-8111-111111111111\",\"outageEpoch\":\"epoch-uuid\",\"phase\":\"Committed\"}]",
-      "outageState": "{\"epochID\":\"epoch-uuid\",\"phase\":\"Unresolved\"}"
+      "schemaVersion": "1",
+      "activeAttempt": "{\"attemptID\":\"request-uid\",\"source\":\"NHC\",\"requestUID\":\"request-uid\",\"nodeUID\":\"node-uid\",\"configUID\":\"config-uid\",\"initialBootID\":\"11111111-1111-4111-8111-111111111111\",\"outageEpoch\":\"epoch-uuid\",\"commitState\":\"Committed\"}",
+      "resetBudget": "[{\"attemptID\":\"request-uid\",\"source\":\"NHC\",\"requestUID\":\"request-uid\",\"nodeUID\":\"node-uid\",\"initialBootID\":\"11111111-1111-4111-8111-111111111111\",\"outageEpoch\":\"epoch-uuid\",\"commitState\":\"Committed\"}]",
+      "outageState": "{\"outageEpoch\":\"epoch-uuid\",\"resolution\":\"Unresolved\"}"
     }
   },
   "reboots": []
@@ -593,7 +593,7 @@ Software reboot and watchdog expiry are two mechanisms for one reset operation. 
 
 #### Recover after a process or host restart
 
-Load the journal before normal monitoring. Read the local kernel boot ID through `ReadBootID`. Compare it with the attempt's permanent `beforeBootID`.
+Load the journal before normal monitoring. Read the local kernel boot ID through `ReadBootID`. Compare it with the attempt's permanent `initialBootID`.
 
 `FenceLatched` applies only to that recorded boot. A valid different boot ID requires an atomic journal update before arming the new boot's watchdog. Record the observation and clear only the old boot's latch. Preserve the attempt and budget history. Resume normal feeding for the new boot.
 
@@ -618,7 +618,7 @@ Keep a durable ledger of requested reservations and every committed requested or
 
 Acceptance charges a requested attempt in the API. Local autonomous commitment charges the local ledger before reset. An outage epoch becomes unresolved when either charge occurs. It clears only after the qualified sustained period of healthy storage and reachable API. A brief recovery, new CR, agent restart, or configuration replacement does not clear it.
 
-Permit at most one autonomous reset per unresolved epoch. Apply the qualified node-level requested limit before acceptance. Exhaustion reports `Succeeded=False`, `Processing=False`, and `Reason=RebootBudgetExhausted` when the API is available. Resolve an unaccepted offer through `Cancelled`. Exact requested limits and the healthy interval remain qualification decisions.
+Permit at most one autonomous reset per unresolved epoch. Apply the qualified node-level requested limit before acceptance. Exhaustion reports `Succeeded=False`, `Processing=False`, and `Reason=ResetBudgetExhausted` when the API is available. Resolve an unaccepted offer through `Cancelled`. Exact requested limits and the healthy interval remain qualification decisions.
 
 After API recovery, reconcile local autonomous entries into the API budget by attempt ID and epoch ID. Repeated reconciliation must not charge an entry twice. Preserve API charges from other observations. Complete reconciliation before accepting a new requested attempt or rearming an epoch.
 
@@ -638,22 +638,24 @@ Proposed additions are shown below. Other existing fields are omitted.
 package v1alpha1
 
 type StorageBasedRemediationStatus struct {
-	NodeUID              types.UID      `json:"nodeUID,omitempty"`
-	ConfigUID            types.UID      `json:"configUID,omitempty"`
-	VolumeMode           string         `json:"volumeMode,omitempty"`
-	BeforeBootID         string         `json:"beforeBootID,omitempty"`
-	ExecutionPhase       string         `json:"executionPhase,omitempty"`
-	ObservedBootID       string         `json:"observedBootID,omitempty"`
-	Cleanup              *CleanupStatus `json:"cleanup,omitempty"`
-	RestrictionsReleased bool           `json:"restrictionsReleased,omitempty"`
+	NodeUID                        types.UID                   `json:"nodeUID,omitempty"`
+	ConfigUID                      types.UID                   `json:"configUID,omitempty"`
+	VolumeMode                     SharedStorageVolumeModeType `json:"volumeMode,omitempty"`
+	InitialBootID                  string                      `json:"initialBootID,omitempty"`
+	ExecutionPhase                 string                      `json:"executionPhase,omitempty"`
+	ObservedBootID                 string                      `json:"observedBootID,omitempty"`
+	Cleanup                        *CleanupStatus              `json:"cleanup,omitempty"`
+	SchedulingRestrictionsReleased *bool                       `json:"schedulingRestrictionsReleased,omitempty"`
 }
 
 type CleanupStatus struct {
-	Phase               string       `json:"phase,omitempty"`
-	StartedAt           *metav1.Time `json:"startedAt,omitempty"`
-	Deadline            *metav1.Time `json:"deadline,omitempty"`
-	OutOfServiceApplied bool         `json:"outOfServiceApplied,omitempty"`
-	Reason              string       `json:"reason,omitempty"`
+	Phase                    string       `json:"phase,omitempty"`
+	StartTime                *metav1.Time `json:"startTime,omitempty"`
+	DeadlineTime             *metav1.Time `json:"deadlineTime,omitempty"`
+	CompletionTime           *metav1.Time `json:"completionTime,omitempty"`
+	OutOfServiceTaintApplied *bool        `json:"outOfServiceTaintApplied,omitempty"`
+	Reason                   string       `json:"reason,omitempty"`
+	Message                  string       `json:"message,omitempty"`
 }
 ```
 
@@ -663,13 +665,13 @@ Peers publish `executionPhase` as `Offered`, `Accepted`, `Cancelled`, or `BootEn
 
 `CleanupStatus` reports one bounded operation. Its phases are `Pending`, `Observing`, `Completed`, `Incomplete`, `Unknown`, and `Skipped`. The reason distinguishes deadline expiry, stop, deletion, supersession, missing permissions, and failed API operations. Events and logs describe remaining resources without storing an unbounded target list.
 
-The recorded deadline never moves after the operation starts. `outOfServiceApplied` records confirmed application, not an inference from elapsed time. Missing cleanup status never means completion.
+The recorded deadline never moves after the operation starts. `outOfServiceTaintApplied` records confirmed application, not an inference from elapsed time. Missing cleanup status never means completion.
 
-`restrictionsReleased` means that this CR no longer holds SBR restrictions. Another holder or an administrator can still keep the Node cordoned or tainted. Do not call this field proof that the Node is schedulable.
+`schedulingRestrictionsReleased` means that this CR no longer holds SBR scheduling restrictions. Another holder or an administrator can still keep the Node cordoned or tainted. Do not call this field proof that the Node is schedulable.
 
 #### Ordered boot observations
 
-The local agent accepts only while its actual host boot ID equals `beforeBootID`. It checks the live Node UID and configuration identity. It reserves its local budget before the conditional acceptance transition.
+The local agent accepts only while its actual host boot ID equals `initialBootID`. It checks the live Node UID and configuration identity. It reserves its local budget before the conditional acceptance transition.
 
 For an Offered request, the target can report a local boot mismatch through a conditional observation update. A peer then changes that offer to `Cancelled` with reason `InitialBootChanged`. It must not rebind the CR or report `BootEnded` for an unaccepted request.
 
@@ -678,7 +680,7 @@ After acceptance, either the local agent or the separate reporter can publish bo
 1. Read the exact `Accepted` Node execution record through the live API.
 2. Check its Node UID and recorded request identity.
 3. Read the current local host boot ID with `ReadBootID`.
-4. Require a valid nonempty ID different from `beforeBootID`.
+4. Require a valid nonempty ID different from `initialBootID`.
 5. Conditionally publish that ID into the same execution record.
 6. On conflict, repeat the identity and phase checks before retrying.
 
@@ -692,7 +694,7 @@ A raw change in `Node.status.nodeInfo.bootID` is insufficient by itself for this
 
 Delayed observations must still match the accepted request, Node UID, and initial boot. Reject observations for another execution or replacement Node. An accepted observation remains valid if a later boot occurs. Never replace its initial boot ID.
 
-If every reporting path is unavailable, keep execution `Accepted` with reason `EvidenceUnavailable`. Stop, deletion, timeout, missing CR, and Node replacement cannot substitute for evidence. No separate local retirement acknowledgement follows valid `BootEnded`.
+If every reporting path is unavailable, keep execution `Accepted` with reason `BootEvidenceUnavailable`. Stop, deletion, timeout, missing CR, and Node replacement cannot substitute for evidence. No separate local retirement acknowledgement follows valid `BootEnded`.
 
 ### 5.8. Requested remediation, escalation, and cleanup
 
@@ -714,7 +716,7 @@ Deletion also restores SBR-owned restrictions without proving that workload dele
 
 After `BootEnded`, start one optional cleanup operation for a request that is still active. Here, optional means that cleanup completion is not required for successful completion of the bounded remediation policy. It is not a new configuration switch.
 
-Persist `startedAt` and `deadline` through a conditional CR status update before the first taint attempt. Use a provisional five-minute internal observation limit. Do not add another configuration field in this proposal. Qualification can adjust this constant.
+Persist `startTime` and `deadlineTime` through a conditional CR status update before the first taint attempt. Use a provisional five-minute internal observation limit. Do not add another configuration field in this proposal. Qualification can adjust this constant.
 
 ```go
 package controller
@@ -727,7 +729,7 @@ Apply `node.kubernetes.io/out-of-service=nodeshutdown:NoExecute` using the exist
 
 Check Node UID, current execution UID, `BootEnded`, `cleanupClosed=false`, and this request's holder inside the Node update. Stop and deletion handling precede new cleanup work. A delayed update cannot apply the taint for an execution that a successor replaced.
 
-Retry failed API operations only within the recorded cleanup period. A peer restart or lost response does not extend that period. Read current state to resolve an uncertain taint update. Record `outOfServiceApplied=true` only after confirming application. A pre-existing matching taint can satisfy application without becoming SBR-owned.
+Retry failed API operations only within the recorded cleanup period. A peer restart or lost response does not extend that period. Read current state to resolve an uncertain taint update. Record `outOfServiceTaintApplied=true` only after confirming application. A pre-existing matching taint can satisfy application without becoming SBR-owned.
 
 Repeated observations are permitted. Do not start another operation when the deadline expires or a terminal result exists.
 
@@ -965,11 +967,11 @@ After a committed reboot, preserve the request history before starting another d
 
 Report desired nodes, ready peer controllers, ready local agents, ready reporters, ready probes, and armed watchdogs through metrics. Configuration status uses concise coverage conditions instead of duplicating these counts. Report controller readiness independently of probe and watchdog readiness. Do not use aggregate Pod readiness as a peer eligibility requirement. A peer-ready count includes the target itself. It does not prove that another eligible peer exists for that target.
 
-Conditions and events expose unavailable peer coverage. Keep per-node detail outside an unbounded configuration list. Do not reuse `ConcurrentWriteable`, which describes shared-storage readiness.
+Conditions and events expose unavailable peer coverage. Keep per-node detail outside an unbounded configuration list. Do not reuse `ConcurrentWriteable`, which describes shared-storage readiness. Report BlockPerNode probe readiness through a new `storageValidation.probeValidation` sibling that records direct-I/O verification, its last probe time, and a message.
 
 The existing `LeadershipAcquired` condition and `HasLeadership()` helper are unused outside tests in the reviewed source and are not part of BlockPerNode.
 
-Expose mode, probe identity, and bounded reasons through status or events. Include `WaitingForExecution`, `Accepted`, `WaitingForBootEvidence`, `EvidenceUnavailable`, `CleanupIncomplete`, `CleanupUnknown`, `ExecutorConflict`, `HistoryUnknown`, `BudgetExhausted`, and `BackendUnqualified`. Metrics cover phase age, reset attempts, coverage, writer conflicts, holder release, and observation results. Never label them with tokens or UIDs.
+Expose mode, probe identity, and bounded reasons through status or events. Include `ExecutionPending`, `ExecutionAccepted`, `BootEvidencePending`, `BootEvidenceUnavailable`, `CleanupIncomplete`, `CleanupResultUnknown`, `LocalAgentConflict`, `HistoryUnreconciled`, `ResetBudgetExhausted`, and `BackendUnqualified`. Metrics cover phase age, reset attempts, coverage, writer conflicts, holder release, and observation results. Never label them with tokens or UIDs.
 
 Report history and writer conflicts. Retain diagnostic timestamps during API loss. Publish current conditions after recovery rather than replaying stale conditions. Treat a finalizer-held request reducing NHC's healthy count as an active alert.
 
@@ -1012,9 +1014,9 @@ Before arming in BlockPerNode, perform these checks:
 
 Record nowayout, magic-close, disable-card, process-exit, and disarm behavior. Never use an unrelated sysfs timeout. Never infer successful disarm from `close()`.
 
-An invalid or unmatched device reports `InvalidWatchdogDevice` and zero coverage. It is not armed. Write-based keepalive is allowed only after positive device qualification.
+An invalid or unmatched device reports `WatchdogDeviceInvalid` and zero coverage. It is not armed. Write-based keepalive is allowed only after positive device qualification.
 
-A non-watchdog path is permitted only behind an explicit test-only flag. It reports `UnsafeTestWatchdogDevice`. The production DaemonSet never emits that path. Preflight uses the same validation and never silently substitutes softdog. It checks the magic-`V` or disable operation result.
+A non-watchdog path is permitted only behind an explicit test-only flag. It reports `WatchdogDeviceUnsafeTestOnly`. The production DaemonSet never emits that path. Preflight uses the same validation and never silently substitutes softdog. It checks the magic-`V` or disable operation result.
 
 Runbooks cover unavailable peers, missing reporter or probe, unknown history, inconsistent ownership, and stuck cleanup or CSI detach. They also cover local agent lock or watchdog failure, Node UID replacement, retained restriction holders, configuration deletion, and downgrade. Forced finalizer removal, API-object absence, and Node deletion are never fencing evidence.
 
@@ -1022,7 +1024,7 @@ Runbooks cover unavailable peers, missing reporter or probe, unknown history, in
 
 ### 6.1. Residual limitation: every evidence path unavailable
 
-The CSI-independent reporter can observe the bound boot ending without the private probe. If every ordered reporting path is unavailable, execution remains `Accepted` with reason `EvidenceUnavailable`.
+The CSI-independent reporter can observe the bound boot ending without the private probe. If every ordered reporting path is unavailable, execution remains `Accepted` with reason `BootEvidenceUnavailable`.
 
 A healthy peer cannot manufacture target boot evidence. This unresolved execution can retain its finalizer and prevent a later request. Cleanup timeout does not resolve it. NHC can also exclude that node from its healthy count while a remediation CR remains.
 
@@ -1044,7 +1046,7 @@ An existing requested operation retains its deadline during API loss. API recove
 
 ### 6.4. Reset-budget qualification
 
-The durable outage ledger permits at most one autonomous reset per unresolved outage period. Requested limits and the sustained healthy interval needed for rearm remain qualification decisions. NHC thresholds cannot replace offline local accounting.
+The durable outage ledger permits at most one autonomous reset per unresolved outage epoch. Requested limits and the sustained healthy interval needed for rearm remain qualification decisions. NHC thresholds cannot replace offline local accounting.
 
 Requested acceptance charges the API record once. Local reservations and autonomous entries prevent a new request from bypassing unknown or consumed allowance.
 
@@ -1096,6 +1098,8 @@ The design does not guarantee that a replacement VM or Pod starts successfully. 
 ## 7. Upgrade / Downgrade Concerns
 
 An upgrade preserves omitted volume mode as `Filesystem`. Explicit `Filesystem` and `Block` retain their existing behavior. Only `BlockPerNode` selects the new lifecycle. Its grace fields remain optional.
+
+Widening the `sharedStorageVolumeMode` enum from `Filesystem;Block` to `Filesystem;Block;BlockPerNode` is a backward-compatible custom resource definition change. It adds one permitted value, removes or retypes nothing, and invalidates no stored object or existing value. It is the only change in this proposal that touches an already published field. Every other API change is a new optional field. Before rolling the definition back to the narrower enum, remove every `BlockPerNode` configuration through its cleanup path. Stored objects carrying that value remain readable under the old schema but cannot be updated.
 
 Install compatible CRDs, webhooks, operator, agent, and reporter images before enabling BlockPerNode. Pin a common release that implements the nodestate contract. The feature is unavailable with common v1.17.0.
 
@@ -1165,7 +1169,7 @@ Extend the existing API, controller, agent, and end-to-end suites. The tests bel
 - Test multiple generations of one CR and successive CR UIDs. Neither reconciliation retries nor a new UID may bypass execution ordering or reset budgets.
 - Preserve autonomous journal state across process, Pod, and host restart. Test full disks, read-only filesystems, late writes, and uncertain write durability.
 - Test lost, corrupt, and unsupported journal history. Unknown history must not reset the autonomous counter or permit an automatic fresh start.
-- Keep storage and API unavailable across boots. Require at most one autonomous reset per unresolved outage period.
+- Keep storage and API unavailable across boots. Require at most one autonomous reset per unresolved outage epoch.
 - Test sustained recovery, interrupted recovery, wall-clock changes. Diagnostic pruning must preserve required budget history.
 - Keep requested execution records unchanged during an autonomous reset. Do not assign an earlier autonomous reset to a later remediation CR.
 
@@ -1191,7 +1195,7 @@ Use envtest for the offer and deletion races. Require actual API conflicts and f
 - Test skipped optional observations, empty complete scans, remaining objects, partial scans, API errors, and unavailable optional resource APIs.
 - Treat partial or failed observations as unknown. Never report workload cleanup completed because an observation failed or its deadline expired.
 - After `BootEnded`, expire the deadline with resources remaining or observations unknown. Complete an unstopped request with `FencingSucceeded=True`, `Succeeded=True`, and `Processing=False`.
-- Keep taint application unconfirmed through deadline expiry. Record cleanup as unknown and `outOfServiceApplied=false` with a reason. Permit the same completion policy after `BootEnded` without claiming that the taint was applied.
+- Keep taint application unconfirmed through deadline expiry. Record cleanup as unknown and `outOfServiceTaintApplied=false` with a reason. Permit the same completion policy after `BootEnded` without claiming that the taint was applied.
 - After expiry, do not extend the deadline or add the taint. Expiry without valid `BootEnded` evidence must not produce success.
 - Retain OOS while its CR remains a holder. Test deletion and rejoin despite incomplete observations, as permitted by the accepted risk.
 - Stop a request that NHC retains for escalation history. Release execution ownership without waiting for workload disappearance and preserve its recorded failure outcome.
@@ -1276,7 +1280,8 @@ A **remediation CR** is a `StorageBasedRemediation` resource. An **SBR config CR
 | Cleanup observation | Bounded API scans of relevant Pods, VMIs, and VolumeAttachments after reboot. |
 | Rejoin | Restoration of SBR-owned scheduling restrictions during deletion, without a complete-cleanup or continuing-isolation guarantee. |
 | Reset budget | Node-level accounting that a new CR, process, or configuration cannot reset. |
-| Outage period | A retained period of failure whose allowance changes only under the qualified sustained-recovery policy. |
+| Outage epoch | A retained period of failure whose allowance changes only under the qualified sustained-recovery policy. |
 | Rearm | Restore reset allowance after the required recovery checks. |
+| Fencing | Legacy SBR condition vocabulary, retained unchanged for the NHC contract. In `BlockPerNode` the corresponding act is the node reset, and `FencingSucceeded` reports the bounded policy result rather than a fence message. |
 
 Offer, acceptance, local commitment, boot evidence, and cleanup outcome are separate facts. A completed bounded policy can have incomplete cleanup. Neither success conditions nor elapsed time establish continuing isolation.
