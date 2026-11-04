@@ -513,7 +513,7 @@ Use the proposed common envelope below. These names specify the required API, no
 | Node name and immutable Kubernetes Node UID | `Document.Node`, `Document.NodeUID` | `node`, `nodeUID` |
 | Current local kernel boot ID | `Document.BootID` | `bootID` |
 | Effective configuration | `Document.Config` | `config`, with string values |
-| Current reset commitment | `Agent.FenceLatched` | `agent.fenceLatched` |
+| Current reset commitment | `Agent.ResetCommitted` | `agent.resetCommitted` |
 | Agent shutdown state | `Agent.Shutdown` | `agent.shutdown` |
 | Required SBR state | `Agent.Extra` | `agent.extra`, with string values |
 | Diagnostic reboot records | `Document.Reboots` | `reboots` |
@@ -542,7 +542,7 @@ The following fragment shows a committed requested attempt. Common also records 
   "agent": {
     "component": "sbr",
     "shutdown": "running",
-    "fenceLatched": true,
+    "resetCommitted": true,
     "extra": {
       "schemaVersion": "1",
       "activeAttempt": "{\"attemptID\":\"request-uid\",\"source\":\"NHC\",\"requestUID\":\"request-uid\",\"nodeUID\":\"node-uid\",\"configUID\":\"config-uid\",\"initialBootID\":\"11111111-1111-4111-8111-111111111111\",\"outageEpoch\":\"epoch-uuid\",\"commitState\":\"Committed\"}",
@@ -559,10 +559,10 @@ The following fragment shows a committed requested attempt. Common also records 
 Use one `Store` and one local decision loop in the process holding the host lock. `Store.Update` serializes each journal transition. The loop also prevents requested and autonomous decisions from overlapping while an API acceptance remains unresolved.
 
 1. Check the exact Node execution record, its permanent identities, the current local boot ID, and the reset budget.
-2. Persist a local reservation with the request UID, boot binding, and stable outage epoch. Keep `FenceLatched=false`.
+2. Persist a local reservation with the request UID, boot binding, and stable outage epoch. Keep `ResetCommitted=false`.
 3. Conditionally change the matching Node record from `Offered` to `Accepted`. Charge its requested budget in that same Node update.
 4. Confirm that acceptance succeeded. After an unknown API response, read the live record before making another decision.
-5. Persist the accepted attempt, its budget entry, and `FenceLatched=true` in one durable journal update.
+5. Persist the accepted attempt, its budget entry, and `ResetCommitted=true` in one durable journal update.
 6. Invoke the software reboot and watchdog fallback defined in Section 5.5.
 
 The Node update uses the request UID to charge the budget once. A retry must adopt the existing charge rather than increment it. Local reconciliation records that same charge without consuming another allowance. Section 5.2 defines the Node record and its conditional updates.
@@ -585,7 +585,7 @@ Before the local latch becomes durable, a persistent journal failure prevents a 
 
 For nowayout or failed-disarm devices, continue feeding in a degraded state until a qualified shutdown or recovery path is available. Never exit and imply a reboot-free stop. A device without a supported fatal-error policy fails qualification before it is armed.
 
-`ErrDurabilityUnconfirmed` means replacement is visible, but survival across a crash is uncertain. It does not authorize a new reset. Common must provide a tested contract for resolving this outcome.
+`ErrDurabilityUnconfirmed` means replacement is visible, but survival across a crash is uncertain. It does not authorize a new reset. Resolve the exact returned candidate with `ConfirmDurability`; do not rerun the mutator that produced it.
 
 After durable local commitment, journal or API failures must not restore watchdog feeding in the committing boot. Shutdown must not disarm that committed watchdog. Late health recovery cannot reverse the commitment.
 
@@ -595,7 +595,7 @@ Software reboot and watchdog expiry are two mechanisms for one reset operation. 
 
 Load the journal before normal monitoring. Read the local kernel boot ID through `ReadBootID`. Compare it with the attempt's permanent `initialBootID`.
 
-`FenceLatched` applies only to that recorded boot. A valid different boot ID requires an atomic journal update before arming the new boot's watchdog. Record the observation and clear only the old boot's latch. Preserve the attempt and budget history. Resume normal feeding for the new boot.
+`ResetCommitted` applies only to that recorded boot. A valid different boot ID requires an atomic journal update before arming the new boot's watchdog. Record the observation and clear only the old boot's commitment. Preserve the attempt and budget history. Resume normal feeding for the new boot.
 
 | Record and boot comparison | Action |
 |---|---|
