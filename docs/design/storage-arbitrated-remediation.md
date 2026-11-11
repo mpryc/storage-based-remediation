@@ -25,6 +25,7 @@ Contributors: Daniel Froehlich ([@DanielFroehlich](https://github.com/DanielFroe
   - [5.8. Requested remediation, escalation, and cleanup](#58-requested-remediation-escalation-and-cleanup)
   - [5.9. NHC policy and reboot limits](#59-nhc-policy-and-reboot-limits)
   - [5.10. Startup, shutdown, and observability](#510-startup-shutdown-and-observability)
+  - [5.11. Durable boot hold and evacuation](#511-durable-boot-hold-and-evacuation)
 - [6. Open Questions](#6-open-questions)
 - [7. Upgrade / Downgrade Concerns](#7-upgrade--downgrade-concerns)
 - [8. Test Plan](#8-test-plan)
@@ -37,7 +38,7 @@ Storage Based Remediation (SBR) currently uses shared storage for heartbeats and
 
 This proposal adds `BlockPerNode` to the existing `sharedStorageVolumeMode` field in the SBR config CR. Each selected node uses a private Block volume to check storage access. SBR stores remediation history in a file on the host. NHC uses SBR as its remediation provider. The host file is called the journal in this document. The local agent writes this file.
 
-The local SBR agent reboots its host and reports boot information. Peer controllers apply OutOfService and check workload cleanup through the API until a fixed deadline. This proposal accepts the existing risks when workloads are not isolated or scheduling restrictions are removed. Existing `Filesystem` and `Block` configurations retain their shared-storage behavior.
+The local SBR agent reboots its host and reports boot information. Before each requested or autonomous reboot, the agent installs a durable boot hold that keeps kubelet and the container runtime from starting after the reboot. Peer controllers apply OutOfService and check workload cleanup through the API until a fixed deadline, and only after validated hold evidence. A held node never becomes Ready: the scheduler cannot place new workloads on it, and its former workloads cannot restart on it. Workloads of a held node are evacuated and run elsewhere. The held node itself does not rejoin automatically; its recovery is a manual operation. Existing `Filesystem` and `Block` configurations retain their shared-storage behavior.
 
 See the [Terminology table](#terminology) for definitions of the resource names and design terms used in this document.
 
@@ -46,6 +47,10 @@ See the [Terminology table](#terminology) for definitions of the resource names 
 The current shared Block volume requires concurrent writes from multiple nodes. Some storage drivers cannot provide this access. Private probe volumes remove that shared-write requirement.
 
 A storage-focused policy should preserve running virtual machines during API or network loss when storage remains usable. When the API remains reachable, NHC should decide whether storage failure permits remediation. When both storage and API access fail, the local agent needs to decide whether to reboot without an API request.
+
+A reboot that happens while the API is unavailable cannot rely on a peer-placed taint. After such a reboot, kubelet can re-register the node as Ready and restart workloads before any controller applies a taint. This proposal closes that window locally: after a committed reboot the node cannot become Ready and cannot run workloads until its old workloads are evacuated through the API.
+
+Every SBR-committed reboot requires evacuation of the node's workloads before anything runs on that node again. Replacement capacity must exist elsewhere. The held node's own recovery is manual: an administrator unblocks the node after verifying the incident is resolved, or the node is reprovisioned. A future extension may add controlled automatic rejoin on top of the same hold state; see Section 5.11.
 
 ## 3. Goals
 
@@ -58,7 +63,10 @@ A storage-focused policy should preserve running virtual machines during API or 
 - Persist request identity and boot information across agent and host restarts.
 - Retain SBR's OutOfService taint without direct Pod deletion. Report the results of cleanup checks within the fixed period separately from reboot success.
 - Report saved information that proves a recorded boot ended, without depending on the probe volume.
-- Continue tracking an accepted remediation request even if NHC stops the request or someone deletes its `StorageBasedRemediation` CR. SBR must still confirm that the request’s recorded initial boot ended (`BootEnded`). Incomplete workload cleanup alone must not prevent CR deletion or later requests after the required boot confirmation and Node updates.
+- For enrolled worker nodes, persist a durable boot hold before each requested or autonomous reboot, so no protected workload can execute on the node after the reboot until evacuation completes.
+- Report hold and boot evidence through a host service that runs without kubelet and without the probe volume.
+- Keep reboot completion, continuing isolation, and workload evacuation as separate facts.
+- Continue tracking an accepted remediation request even if NHC stops the request or someone deletes its `StorageBasedRemediation` CR. SBR must still confirm that the request’s recorded initial boot ended (`BootEnded`). Incomplete workload cleanup alone must not prevent CR deletion or later requests after the required boot confirmation and Node updates. Evacuation status is reported separately.
 
 ## 4. Non-Goals
 
@@ -67,7 +75,10 @@ A storage-focused policy should preserve running virtual machines during API or 
 - Perform or queue cleanup for an autonomous remediation during API loss.
 - Provide general hard-dead-node VM high availability without a separately qualified external fencing topology.
 - Support multiple StorageClasses or multiple probes per node in this release.
-- Guarantee remediation CR lifecycle progress when no peer that meets Section 5.2 requirements remains running with API access.
+- Automatically rejoin or release a held node. Node recovery is manual in this release; the future controlled-rejoin extension is summarized in Section 5.11.
+- Hold unclean boots that happened without a recorded SBR reboot decision. This release holds only SBR-committed reboots; the residual window is recorded in Section 6.10.
+- Enable the boot-hold profile on control-plane nodes, single-node OpenShift, or nodes required to host recovery dependencies under the placement rules in Section 5.11.
+- Guarantee remediation CR lifecycle progress when no peer that meets Section 5.2 requirements remains running with API access, except the operator evacuation routine in Section 5.11.
 
 ## 5. Design
 
@@ -82,28 +93,30 @@ Each requested remediation below requires a peer that meets the requirements in 
 | 1 | Healthy storage and API | The local agent probes storage, feeds the watchdog, and reports storage as healthy. | Probe results describe the selected backend, not every workload volume. |
 | 2 | Cluster-wide API outage with healthy storage | The local agent continues feeding the watchdog. It does not reboot its host for API loss alone. | Other Kubernetes and workload controllers have independent behavior. |
 | 3 | Broad storage outage with reachable API | The local agent reports unhealthy storage after `maxConsecutiveFailures` consecutive failed health evaluations. It waits for a valid request from NHC. Running peers reconcile through the API despite their own probe failures. | NHC thresholds can block new requests. Reports can arrive late, and agents can already have decided to reboot. Therefore, these thresholds cannot guarantee that no node reboots. Peer startup can remain blocked by CSI. |
-| 4 | Storage and API unavailable | After storage becomes unhealthy and the total-outage grace expires, the local agent performs at most one autonomous reboot during the unresolved outage period. SBR skips workload cleanup for this attempt and preserves any existing requested-remediation record. | The agent cannot reboot autonomously again if it has used its one attempt for the outage or cannot establish its history. Recovery of Pods elsewhere is not guaranteed. |
+| 4 | Storage and API unavailable | After storage becomes unhealthy and the total-outage grace expires, the local agent performs at most one autonomous reboot during the unresolved outage period. SBR skips workload cleanup for this attempt and preserves any existing requested-remediation record. | The agent cannot reboot autonomously again if it has used its one attempt for the outage or cannot establish its history. After reboot, the host stays held under Section 5.11; its workloads are evacuated after the API recovers. Node rejoin is manual. Recovery of Pods elsewhere is not guaranteed. |
 | 5 | One node loses API or cluster-network access | The local agent keeps feeding the watchdog while its storage remains healthy. | Configure NHC for the storage condition only. |
-| 6 | One node loses storage with API available | NHC creates a request. A peer records it as Offered on the Node. The target agent accepts the request and reboots. After the request reaches `BootEnded`, a peer applies OutOfService and checks cleanup until completion or the deadline. | Processing can stop while an accepted request has not reached BootEnded or the required boot information is unavailable. Continuing isolation is not guaranteed. |
-| 7 | Kernel panic, host freeze, or power loss | A qualified armed watchdog can reboot a powered host that stops feeding it. | It cannot restore power. A dead node cannot publish the storage condition. Hard-dead failover is outside the base policy. |
+| 6 | One node loses storage with API available | NHC creates a request. A peer records it as Offered on the Node. The target agent accepts the request and reboots. After the request reaches `BootEnded`, a peer applies OutOfService and checks cleanup until completion or the deadline. | Processing can stop while an accepted request has not reached BootEnded or the required boot information is unavailable. Rebooted targets remain held under Section 5.11; OutOfService additionally requires validated hold evidence. |
+| 7 | Kernel panic, host freeze, or power loss | A qualified armed watchdog can reset a powered host that stops feeding it. | It cannot restore power. A boot without a recorded SBR reboot decision is not held in this release; see Section 6.10. A dead node cannot publish the storage condition. Hard-dead failover is outside the base policy. |
 | 8 | Planned agent restart or upgrade | Before a planned agent stop, the local agent disarms its watchdog if it has not recorded a reboot decision. It preserves request history. Another peer that meets Section 5.2 requirements resumes the same API lifecycle state. After startup, the local agent compares the current host boot ID with the saved beforeBootID. | Preserve peer coverage during rollout. Check that the hardware supports watchdog disarm. A replacement local agent must acquire the host lock before controlling the watchdog. |
 | 9 | Kubelet failure with healthy storage | The local agent continues feeding the watchdog while it remains functional. | This storage policy does not remediate every kubelet failure. |
 | 10 | Slow or hung storage I/O | Bound each complete probe with `ioTimeout`. Count failed health evaluations without blocking watchdog decisions or peer processing of remediation CRs. | A deadline cannot cancel blocked kernel I/O. Limit unfinished probe operations within each process. Do not share locks that can block these independent tasks. |
 | 11 | Network partition with healthy storage | Do not reboot solely for the partition. This NHC policy does not request relocation solely for it. | This is not a guarantee against concurrent workloads created by other controllers. |
-| 12 | API or storage recovers after acceptance | The local agent completes the accepted reboot. It preserves the request’s initial boot ID and attempt history. If the local boot ID changes, the local agent clears only the FenceLatched flag for the previous boot. The local agent or reporter publishes boot information as Section 5.7 requires. A peer validates it before recording BootEnded. | When NHC stops a request or someone deletes its remediation CR, a peer can cancel the request only in Offered. Cleanup checks remain optional and have a fixed deadline. |
+| 12 | API or storage recovers after acceptance | The local agent completes the accepted reboot. It preserves the request’s initial boot ID and attempt history. If the local boot ID changes, the local agent clears only the FenceLatched flag for the previous boot. The host reporter publishes boot information while kubelet is held. Clearing the old FenceLatched flag does not clear the boot hold. A peer validates it before recording BootEnded. | When NHC stops a request or someone deletes its remediation CR, a peer can cancel the request only in Offered. Cleanup checks remain optional and have a fixed deadline. |
 | 13 | Different nodes require different StorageClasses | Deferred. Add explicit node-group to StorageClass mapping. | See Section 6. |
 | 14 | One node uses several storage backends | Deferred. Add multiple probes and a health aggregation policy. | See Section 6. |
-| 15 | Stuck or terminating workload Pod | The peer uses OutOfService only. At the fixed deadline, it finishes the policy and records incomplete or unknown cleanup separately. When someone deletes the remediation CR, the peer removes only SBR-added restrictions that no other CR requires. | Workload finalizers cannot retain execution indefinitely. Workload recovery and safe rejoin are not guaranteed. |
+| 15 | Stuck or terminating workload Pod | The peer uses OutOfService only. At the fixed deadline, it finishes the policy and records incomplete or unknown cleanup separately. When someone deletes the remediation CR, the peer removes only SBR-added restrictions that no other CR requires. | Workload finalizers cannot retain execution indefinitely. The independent boot hold retains restrictions until evacuation completes; node rejoin is manual. |
 | 16 | Host journal unavailable or recovered | The local agent preserves known reboot decisions and compares them with trusted API records. If autonomous reboot history is unknown, do not permit another autonomous reboot. Peers continue their independent API work. | Missing history cannot prove that no autonomous reboot occurred during the outage. The read order in Section 5.7 can still establish BootEnded for a known accepted request. |
 | 17 | Repeated remediation on persistent failure | Each new valid remediation CR permits one requested reboot after ownership release. Permit at most one autonomous reboot per incident. | Restore permission for one autonomous reboot after continuous healthy storage and reachable API for `autonomousRebootRecoveryPeriod`, which defaults to five minutes. |
 
 ### 5.2. Components and ownership
 
+**Budget** means the durable permission for at most one autonomous reboot per unresolved outage period. Consuming it records an autonomous attempt; only continuous recovery and reconciled history rearm it. Requested reboots do not consume this budget.
+
 NHC watches `SBRStorageUnhealthy=True` and creates an SBR remediation CR. Its name identifies the target node.
 
 Peer agents run the existing `SBRRemediationReconciler`. In this document, a peer means this controller running on another node. Peer controllers process requests concurrently without a lifecycle leader or a Lease per CR. The target's peer controller skips its own Node UID. The target’s local monitoring loop accepts requests for its own host and performs the requested reboot.
 
-The operator’s configuration controller manages SBR configurations and deployments. Its existing leader election does not coordinate remediation requests. A separate reporter can start without the probe volume. It reads the host boot ID and publishes observations. It cannot accept requests, control the watchdog, or perform cleanup.
+The operator’s configuration controller manages SBR configurations and deployments. Its existing leader election does not coordinate remediation requests. The operator also runs an evacuation routine that applies OutOfService for held incidents when no eligible peer is available; see Section 5.11. A host-installed reporter starts without kubelet and without the probe volume. It reads the host boot ID and the journal, and publishes observations through its own Node status. It cannot accept requests, control the watchdog, perform cleanup, or release a hold.
 
 `BlockPerNode` uses these components:
 
@@ -116,12 +129,12 @@ flowchart TB
     Local["Local agent"] --> Probe["Private Block probe"]
     Local --> Journal["Durable host journal"]
     Local --> Watchdog["Watchdog and software reboot"]
-    Reporter["CSI-independent reporter"] --> Boot["Current host boot ID"]
+    Reporter["Host boot reporter"] --> Boot["Current host boot ID"]
     Reporter -->|read-only| Journal
   end
   Record --> Local
   Local -->|acceptance and observations| Record
-  Reporter -->|boot observation only| Record
+  Reporter -->|own Node status observations| Record
   Peers --> OOS["OutOfService and bounded API observations"]
   Operator["Operator: configuration and deployments"] --> Local
   Operator --> Reporter
@@ -129,7 +142,7 @@ flowchart TB
 
 A peer can process a target’s requests when it runs on a different Node and uses the configuration UID recorded for the target. It needs API access and permission to process requests and update their records. Its probe need not be healthy, its watchdog need not be ready, and its Pod need not report Ready. Peers process requests across namespaces.
 
-At least one peer that meets Section 5.2 requirements must remain running with API access for each target requiring lifecycle work. The peer controller remains in the probe Pod. CSI attachment failure can therefore prevent a replacement peer from starting. The reporter does not replace a missing peer controller.
+At least one peer that meets Section 5.2 requirements must remain running with API access for each target requiring ordinary lifecycle work. The peer controller remains in the probe Pod. CSI attachment failure can therefore prevent a replacement peer from starting. The host reporter does not replace a missing peer controller. A held node cannot run a peer Pod; the operator evacuation routine in Section 5.11 can apply OutOfService for a held incident without a peer on the target.
 
 #### Storage-independent reconciliation
 
@@ -479,7 +492,7 @@ The local agent must select the private prober before shared-storage initializat
 
 The BlockPerNode entry point must branch before the current storage preflight and constructor. Initialize API clients and start the peer manager without opening the probe. Then initialize the local agent independently. The existing constructor initializes storage and NodeMap before its manager, so it cannot provide this ordering unchanged. Section 5.10 defines the required lifetime separation.
 
-Run the evidence reporter in a separate DaemonSet without the probe volume. It mounts the host journal read-only and has no watchdog device. A sidecar is insufficient because the entire local agent Pod can remain pending when its probe cannot attach. If a selected node’s local agent or reporter Pod is pending, the configuration controller must report missing coverage through status and events.
+Run the evidence reporter as the host service in Section 5.11, with read-only journal access and no watchdog device. Neither a sidecar nor a separate DaemonSet can report while kubelet is held. Report missing host-reporter coverage independently of local agent Pod readiness. The Pod-backed CSI probe is unavailable during the boot hold and cannot be its prerequisite.
 
 The initial implementation keeps one StorageClass across BlockPerNode configurations. Admission rejects different selections, and the controller checks concurrent creations before starting agents. Section 6 describes the deferred extension.
 
@@ -581,7 +594,7 @@ This design requires a new `github.com/medik8s/common/pkg/nodestate` package. It
 - Safe path handling.
 - Atomic temporary writes, file `fsync`, rename, and directory `fsync`.
 
-The local agent writes `/var/lib/medik8s/state/sbr.json` on the host. Mount its directory at `/var/lib/medik8s/state` inside the local agent container. This path is independent of the probe volume and Pod identity. Only the process holding the local agent lock writes the journal. The reporter can read completed snapshots.
+The local agent writes `/var/lib/medik8s/state/sbr.json` on the host. Mount its directory at `/var/lib/medik8s/state` inside the local agent container. This path is independent of the probe volume and Pod identity. Only the process holding the common host executor lock writes the journal; this includes serialized host boot-hold and recovery transactions when the local agent does not own it. The reporter can read completed snapshots.
 
 Use the proposed common envelope below. These names specify the required API, not an existing `v1.17.0` implementation.
 
@@ -597,7 +610,7 @@ Use the proposed common envelope below. These names specify the required API, no
 | Diagnostic reboot records | `Document.Reboots` | `reboots` |
 | Diagnostic samples and events | `Document.IO`, `Document.Conditions`, `Document.Events` | `io`, `conditions`, `events` |
 
-Use four SBR keys inside `agent.extra`: `sbrStateVersion`, `activeAttempt`, `resetLedger`, and `outageState`. Set `sbrStateVersion` to the string `"1"`. Encode each object or array as a JSON string because `Agent.Extra` has type `map[string]string`. The local agent validates and changes these records. The common library preserves them without interpreting their contents.
+Use five SBR keys inside `agent.extra`: `sbrStateVersion`, `activeAttempt`, `resetLedger`, `outageState`, and `bootHold`. Set `sbrStateVersion` to the string `"1"`. Section 5.11 defines `bootHold`. The first BlockPerNode release ships this five-key state directly; there is no earlier four-key format to migrate. A reader that encounters an unknown state version must fail closed rather than infer the absence of a hold. Encode each object or array as a JSON string because `Agent.Extra` has type `map[string]string`. The local agent validates and changes these records. The common library preserves them without interpreting their contents.
 
 The requested action identity is `(StorageBasedRemediation UID, Node UID)`. Use the request UID as its `attemptID`. Bind it permanently to the Node UID, configuration UID, and `beforeBootID`. Generation changes and configuration replacement do not permit another attempt for that request. A new valid request UID permits another requested attempt after execution ownership becomes available, without a limit on the number of requested reboots.
 
@@ -625,7 +638,8 @@ The following fragment shows a requested attempt whose reboot decision the agent
       "sbrStateVersion": "1",
       "activeAttempt": "{\"attemptID\":\"request-uid\",\"source\":\"NHC\",\"requestUID\":\"request-uid\",\"nodeUID\":\"node-uid\",\"configUID\":\"config-uid\",\"beforeBootID\":\"11111111-1111-4111-8111-111111111111\",\"phase\":\"Committed\"}",
       "resetLedger": "[{\"attemptID\":\"request-uid\",\"source\":\"NHC\",\"requestUID\":\"request-uid\",\"nodeUID\":\"node-uid\",\"beforeBootID\":\"11111111-1111-4111-8111-111111111111\",\"phase\":\"Committed\"}]",
-      "outageState": "{\"phase\":\"Idle\"}"
+      "outageState": "{\"phase\":\"Idle\"}",
+      "bootHold": "{\"version\":1,\"phase\":\"Required\",\"source\":\"NHC\",\"incidentID\":\"hold-uuid\",\"nodeUID\":\"node-uid\",\"configUID\":\"config-uid\",\"beforeBootID\":\"11111111-1111-4111-8111-111111111111\",\"attemptID\":\"request-uid\"}"
     }
   },
   "reboots": []
@@ -639,11 +653,11 @@ The local agent uses one `Store` and one decision loop in the process holding th
 The local agent performs these steps for a requested reboot:
 
 1. Check the exact Node execution record, its permanent identities, and the current local boot ID.
-2. Persist a local request reservation with the request UID and boot binding. Keep `FenceLatched=false`.
+2. Persist a local request reservation and a `bootHold` in phase `Required` with the request UID and boot binding. Keep `FenceLatched=false`. This closes the crash window between API acceptance and local commitment. A confirmed cancellation can clear an uncommitted hold only with matching identity, an unchanged boot, and no recorded reboot decision, under the executor lock.
 3. Conditionally change the matching Node record from `Offered` to `Accepted`. Preserve the autonomous reboot count and limit. Do not count this requested attempt as an autonomous attempt.
 4. Confirm that acceptance succeeded. After an unknown API response, read the live record before making another decision.
 5. Persist the accepted attempt, its execution history, and `FenceLatched=true` in one durable journal update.
-6. Invoke the software reboot and watchdog fallback defined in Section 5.5.
+6. Install the durable boot hold of Section 5.11, then invoke the software reboot and watchdog fallback defined in Section 5.5. A failed or partially durable hold installation must stop the sequence before the reboot.
 
 The Node update uses the request UID to accept the attempt once. A retry must adopt the existing acceptance without authorizing another attempt. Local reconciliation records that same acceptance without changing the permission for one autonomous reboot. Section 5.2 defines the Node record and its conditional updates.
 
@@ -675,7 +689,7 @@ Software reboot and watchdog expiry are two mechanisms for one reboot operation.
 
 Before normal monitoring, the local agent loads the journal and reads the local kernel boot ID through `ReadBootID`. It compares this ID with the attempt’s permanent `beforeBootID`.
 
-`FenceLatched` applies only to the boot identified by the attempt’s recorded beforeBootID. If the current local boot ID is valid and different, update the journal atomically before arming the watchdog for the current boot. Record the new boot ID and clear only the FenceLatched flag for the previous boot. Preserve the attempt and reboot-count history. Resume normal watchdog feeding for the current boot.
+`FenceLatched` applies only to the boot identified by the attempt’s recorded beforeBootID. If the current local boot ID is valid and different, update the journal atomically before arming the watchdog for the current boot. Record the new boot ID and clear only the FenceLatched flag for the previous boot. Preserve the attempt, bootHold, and reboot-count history. Clearing FenceLatched does not clear the boot hold. The local agent can resume normal watchdog monitoring only after the node is recovered under Section 5.11; a held node cannot start the agent Pod.
 
 | Record and boot comparison | Action |
 |---|---|
@@ -696,7 +710,7 @@ The peer does not require a separate acknowledgement from the local agent that i
 
 Keep a durable record of requested reservations and every requested or autonomous attempt whose reboot decision the agent recorded. Use stable attempt IDs. Assign an outage period ID, called an epoch ID, only to autonomous attempts. Before recording an autonomous reboot decision, use the existing outage period if its recovery requirements are not yet met. If no such period exists, save the proposed outage period before acting. Requested attempts retain their history but do not change whether another autonomous reboot is permitted.
 
-Before rebooting autonomously, the local agent records the attempt in its journal and marks the outage period as unresolved. The outage period ends only after storage remains healthy and the API remains reachable for `autonomousRebootRecoveryPeriod`. This period defaults to five minutes.
+Before rebooting autonomously, the local agent atomically records the attempt, marks the outage period as unresolved, and persists `bootHold` in phase `Required` with the same incident binding. It then installs the durable boot hold of Section 5.11 before rebooting. The outage period ends only after storage remains healthy and the API remains reachable for `autonomousRebootRecoveryPeriod`. This period defaults to five minutes.
 
 The first failed probe, including deadline expiry, restarts this recovery interval. Do not wait for the unhealthy threshold. API failure also restarts it. Start measuring storage recovery again only after a fresh complete probe succeeds. A brief recovery, new CR, requested reboot, agent restart, or configuration replacement does not permit another autonomous reboot.
 
@@ -763,12 +777,12 @@ After the target agent accepts the request, either the local agent or the separa
 2. Check its Node UID and recorded request identity.
 3. Read the current local host boot ID with `ReadBootID`.
 4. Require a valid nonempty ID different from `beforeBootID`.
-5. Conditionally publish that ID into the same execution record.
+5. Conditionally publish that ID and the exact execution binding in the `SBRBootHeld` Node status observation against the Node version read in step 1. Do not let the reporter patch the execution annotation.
 6. On conflict, repeat the identity and phase checks before retrying.
 
 The reporter cannot change execution phase or budget. A peer that meets Section 5.2 requirements validates the observation against the current accepted record. It then changes `Accepted` to `BootEnded` through a conditional Node update. The transition and accepted observed boot ID persist together.
 
-The reporter uses the Node record even when the CR no longer exists. It does not require the probe device to attach. Journal observations can provide diagnostic context, but an authoritative accepted record already supplies the requested identity and initial boot.
+The host reporter reads the Node record even when the CR no longer exists. It publishes the ordered observation through `SBRBootHeld` in Node status, not by patching the main Node resource; Section 5.11 defines the payload and validation. It does not require the probe device to attach. Journal observations can provide diagnostic context, but an authoritative accepted record already supplies the requested identity and initial boot.
 
 Reading a different local boot ID after reading Accepted establishes that the boot identified by beforeBootID ended. It does not establish which reset mechanism caused the change. It also does not prove continuing workload isolation.
 
@@ -782,17 +796,15 @@ If neither the local agent nor reporter can publish boot evidence, the peer keep
 
 BlockPerNode retains SBR's OutOfService approach. The BlockPerNode remediation path does not directly delete workload Pods, VMIs, VolumeAttachments, PVCs, or PVs. Kubernetes, KubeVirt, and CSI controllers perform their normal resource handling.
 
-A peer cordons the Node, and the target accepts one reboot request. The agent or reporter then publishes information showing that the recorded initial boot ended. After a peer validates this information, it applies OutOfService and checks resource removal. When someone deletes the remediation CR, the peer removes only the scheduling restrictions SBR added, unless another CR still requires them.
+A peer cordons the Node, and the target accepts one reboot request. The agent or reporter then publishes information showing that the recorded initial boot ended. After a peer validates this information and the hold evidence of Section 5.11, it applies OutOfService and checks resource removal. When someone deletes the remediation CR, the peer removes only the scheduling restrictions SBR added, unless another CR still requires them.
 
-#### Accepted isolation and rejoin risks
+#### Required isolation before cleanup
 
-This proposal applies OutOfService after a peer validates that the recorded initial boot ended. It does not prove that workloads remain isolated. It follows the existing SBR approach and accepts the resulting risk.
+A changed boot ID establishes only BootEnded. Before adding OutOfService, a peer validates the current hold evidence from Section 5.11: an `SBRBootHeld` observation with a matching incident, a never-admitted current boot, and the matching execution where one exists. Kubelet stop, API recovery, elapsed time, and VolumeAttachment absence do not establish isolation.
 
-Kubernetes requires shutdown or power-off verification before OutOfService. A changed boot ID does not meet that prerequisite. Workloads can restart before the peer applies the taint. Force deletion and detach can then overlap workload writes. See [Kubernetes shutdown guidance](https://kubernetes.io/docs/concepts/cluster-administration/node-shutdown/#non-graceful-node-shutdown-handling).
+Kubernetes requires shutdown or power-off verification before OutOfService. OutOfService force-detaches volumes, so applying it while an old writer may still run can corrupt those volumes. The committed reboot plus the durable boot hold provide that verification for SBR-committed reboots. See [Kubernetes shutdown guidance](https://kubernetes.io/docs/concepts/cluster-administration/node-shutdown/#non-graceful-node-shutdown-handling).
 
-The design does not add an external fence, early-boot workload hold, isolation attestation, or rejoin authorization protocol. It does not claim protection against duplicate writers. Section 6 records this accepted limitation.
-
-During remediation CR deletion, the peer removes SBR’s scheduling restrictions without proving that workload deletion and volume detach finished. Removing the taint cannot cancel operations already accepted by other controllers. This is an accepted risk, not evidence of successful cleanup.
+Requested CR completion, cleanup deadline expiry, and CR deletion do not authorize workload execution on the held node. The boot hold remains until evacuation completes and the node is manually recovered under Section 5.11.
 
 #### One cleanup operation with a fixed deadline
 
@@ -809,7 +821,7 @@ const blockPerNodeCleanupObservationTimeout = 5 * time.Minute
 
 The peer applies `node.kubernetes.io/out-of-service=nodeshutdown:NoExecute` using the existing `ensureOutOfServiceTaint()` behavior with conditional ownership checks. Preserve the original snapshot and all current listed CRs.
 
-Check Node UID, current execution UID, `BootEnded`, `cleanupClosed=false`, and this request’s entry in the restrictions list inside the Node update. Before new cleanup work, the peer handles any NHC stop request or deletion of the remediation CR. A delayed update cannot apply the taint for an execution that a successor replaced.
+Check Node UID, current execution UID, `BootEnded`, valid Section 5.11 hold evidence, `cleanupClosed=false`, and this request’s entry in the restrictions list inside the Node update. Before new cleanup work, the peer handles any NHC stop request or deletion of the remediation CR. A delayed update cannot apply the taint for an execution that a successor replaced.
 
 Retry failed API operations only within the recorded cleanup period. A peer restart or lost response does not extend that period. Read current state to resolve an uncertain taint update. Record `outOfServiceApplied=true` only after confirming application. A pre-existing matching taint can satisfy application without becoming SBR-owned.
 
@@ -842,11 +854,11 @@ The peer discovers current workload resources through the live API. It does not 
 - Treat a missing optional KubeVirt API as not applicable only after API discovery confirms that it is absent.
 - Treat permission errors, failed lists, incomplete pages, and expired continuation tokens as unknown results.
 
-Exclude only verified SBR agent and reporter Pods. Check namespace, Node identity, Pod UID, DaemonSet owner UID, and configuration ownership. A label alone does not establish an exclusion.
+Exclude only verified SBR agent Pods; the host reporter has no Pod. Check namespace, Node identity, Pod UID, DaemonSet owner UID, and configuration ownership. A label alone does not establish an exclusion.
 
 Exclude private probe attachments only when the PV, PVC, and Pod ownership chain establishes their purpose. Missing or unverifiable objects do not establish an exclusion. An excluded volume has no Kubernetes toleration of its own. Its consuming Pod must tolerate OutOfService.
 
-Add this toleration to both agent and reporter Pod templates:
+Add this toleration to the agent Pod template:
 
 ```yaml
 spec:
@@ -866,11 +878,11 @@ Complete fresh scans are required for `Completed`. Separate lists do not form an
 
 #### Conditions and NHC behavior
 
-After `BootEnded` and either cleanup completion or deadline expiry, the peer sets these conditions on an active remediation CR:
+After `BootEnded`, validated hold evidence, and either cleanup completion or deadline expiry, the peer sets these conditions on an active remediation CR. Without validated hold evidence, do not report `FencingSucceeded` or `Succeeded`; retain the hold and report `IsolationUnverified`:
 
 | Condition | Value | Meaning |
 |---|---|---|
-| `FencingSucceeded` | `True` | The accepted reboot completed and the remediation policy with a fixed cleanup deadline finished. |
+| `FencingSucceeded` | `True` | The accepted boot ended, the hold remains enforced, and the bounded cleanup policy finished. The node awaits evacuation and manual recovery. |
 | `FencingInProgress` | `False` | No requested reboot remains in progress. |
 | `Succeeded` | `True` | The policy with a fixed cleanup deadline completed, including its accepted cleanup limitations. |
 | `Processing` | `False` | SBR finished active processing for this request. |
@@ -949,7 +961,7 @@ These are proposed helpers, not existing interfaces. Node watches supply retaine
 
 #### API loss and autonomous remediation
 
-Autonomous remediation performs no workload cleanup and does not schedule cleanup for later. It preserves the local autonomous reboot history and limit, and any accepted request.
+Autonomous remediation preserves the local autonomous reboot history and limit, any accepted request, and a durable boot hold. During API loss it performs no API cleanup. After API recovery, peers and the operator evacuation routine reconcile the held incident under Section 5.11, including standard OutOfService processing and applicable CSI state, without manufacturing a remediation CR. API recovery alone never releases workloads or unblocks the node.
 
 An autonomous reboot can end the boot identified by an already accepted request’s beforeBootID. Boot information read and published as Section 5.7 requires can then establish BootEnded for that request. It does not prove SBR's requested reboot caused the reboot. An unaccepted request cannot claim an earlier autonomous reboot.
 
@@ -970,10 +982,10 @@ sequenceDiagram
   A->>A: Confirm acceptance, persist latch, reset
   R->>N: Read exact Accepted record
   R->>R: Read current local host boot ID
-  R->>N: CAS matching changed-boot observation
+  R->>N: CAS own-status boot and hold observation
   P->>N: CAS Accepted to BootEnded
   P->>P: Persist fixed cleanup deadline
-  P->>N: Apply OutOfService conditionally
+  P->>N: Apply OutOfService only with validated hold evidence
   K->>K: Process Pod deletion and volume detach
   P->>K: Observe Pods, VMIs, and attachments
   P->>P: Complete or expire observation with truthful result
@@ -1055,7 +1067,7 @@ Restart recovery measurement when continuity cannot be established. Preserve acc
 
 After a reboot whose decision the agent recorded, the local agent preserves request history before starting another decision cycle. Before a planned agent stop without a recorded reboot decision, the local agent records its shutdown and verifies watchdog disarm. A clean shutdown marker is diagnostic information, not reboot evidence.
 
-Report desired nodes, ready peer controllers, ready local agents, ready reporters, ready probes, and armed watchdogs through metrics. Configuration status uses concise coverage conditions instead of duplicating these counts. Report controller readiness independently of probe and watchdog readiness. Do not require the whole Pod to report Ready before its peer controller can process another node’s requests. A peer-ready count includes the target itself. It does not prove that another peer that meets Section 5.2 requirements exists for that target.
+Report desired nodes, ready peer controllers, ready local agents, healthy host reporter services, ready probes, and armed watchdogs through metrics. Configuration status uses concise coverage conditions instead of duplicating these counts. Report controller readiness independently of probe and watchdog readiness. Do not require the whole Pod to report Ready before its peer controller can process another node’s requests. A peer-ready count includes the target itself. It does not prove that another peer that meets Section 5.2 requirements exists for that target.
 
 Conditions and events expose unavailable peer coverage. Keep per-node detail outside an unbounded configuration list. Do not reuse `ConcurrentWriteable`, which describes shared-storage readiness.
 
@@ -1065,7 +1077,7 @@ Expose mode, probe identity, and bounded reasons through status or events. Inclu
 
 Report history and writer conflicts. Retain diagnostic timestamps during API loss. Publish current conditions after recovery rather than replaying stale conditions. Treat a finalizer-held request reducing NHC's healthy count as an active alert.
 
-Keep separate service accounts for the operator, the agent that runs both the peer controller and local monitoring, and the reporter. The peer controller and local agent share one process identity and therefore share its API permissions. Kubernetes RBAC cannot separate those roles inside that process.
+Keep separate service accounts for the operator and the agent that runs both the peer controller and local monitoring. The host reporter uses the existing node certificate identity under Section 5.11, not a cluster-wide reporter service account. The peer controller and local agent share one process identity and therefore share its API permissions. Kubernetes RBAC cannot separate those roles inside that process.
 
 Update [agent RBAC markers](../../cmd/sbr-agent/main.go) and the generated [agent role](../../config/rbac/sbr_agent_generated_role.yaml) for lifecycle work:
 
@@ -1087,9 +1099,9 @@ Retain the request watch in `SetupWithManager()`. Watch Node execution records a
 
 Cached clients require list and watch permissions for their informers. Do not restrict workload scans or remediation CR watches to the configuration namespace.
 
-Only the local agent component accesses the watchdog and writes the journal. The reporter has read-only host state and observation updates to the Node record. A shared DaemonSet service account cannot scope each Pod dynamically to its Node or restrict individual status fields. Use a separate evidence resource if field separation is a security boundary.
+Only the local agent component controls the watchdog. The agent and the serialized host boot-hold and recovery transactions write the journal through the same host executor lock; the reporter is read-only. During a boot hold, the agent Pod cannot run. The host reporter uses GET on its own Node and PATCH on its own nodes/status, never main-resource Node patching. Preserve unrelated status conditions with optimistic concurrency.
 
-The reporter needs Node read and conditional update access to publish observations after forced CR deletion. Its implementation changes only the matching observation field. RBAC cannot restrict a Node update to one annotation field. Treat agent and reporter code as trusted protocol participants. Preserve accepted state and budget against unrelated Node patches.
+Existing peer agents retain their lifecycle permissions and remain trusted privileged components; this change does not claim to remove that existing risk. Do not copy their service-account credentials to the host. The node identity used by the host reporter cannot patch taints (refused by NodeRestriction); own-node labels are natively permitted to node identities, and the reporter never uses that power — it writes only its own condition in nodes/status and never the execution annotation. The operator evacuation routine needs the peer's Node and workload/attachment discovery permissions plus OutOfService taint application; it requires no workload-delete permission and no host privileges.
 
 Update manifests and OpenShift Security Context Constraints (SCC) bindings for the `/var/lib/medik8s/state` host mount. Require directory mode `0700`, file mode `0600`, expected ownership, no-follow opens, and protection against symlink and path replacement. Avoid storing credentials. A compromised host root can forge local state and is outside this trust boundary.
 
@@ -1108,7 +1120,129 @@ For an invalid or unmatched device, the local agent reports `InvalidWatchdogDevi
 
 A non-watchdog path is permitted only behind an explicit test-only flag. The local agent reports `UnsafeTestWatchdogDevice` when it uses that path. The production DaemonSet never emits that path. Preflight uses the same validation and never silently substitutes softdog. It checks the magic-`V` or disable operation result.
 
-Runbooks cover unavailable peers, missing reporter or probe, unknown history, inconsistent ownership, and stuck cleanup or CSI detach. They also cover local agent lock or watchdog failure, Node UID replacement, CRs retained in the restrictions list, configuration deletion, and downgrade. Forced finalizer removal, API-object absence, and Node deletion are never fencing evidence.
+Runbooks cover unavailable peers, missing reporter or probe, unknown history, inconsistent ownership, and stuck cleanup or CSI detach. Expose `BootHoldActive`, `IsolationUnverified`, `EvacuationBlocked`, and `HostCredentialExpired` with bounded blocker references; never put credentials or high-cardinality IDs in metric labels. They also cover local agent lock or watchdog failure, Node UID replacement, CRs retained in the restrictions list, configuration deletion, downgrade, and both manual recovery procedures of Section 5.11. Forced finalizer removal, API-object absence, and Node deletion are never fencing evidence.
+
+### 5.11. Durable boot hold and evacuation
+
+This section defines a durable, local boot hold for SBR-committed reboots, the host reporter that publishes hold evidence, the evacuation of the held node's workloads, and the manual recovery procedures. The design goal is ordered by priority: prevent any workload execution on the node after a committed reboot, evacuate the node's workloads elsewhere, and treat the held node's own recovery as a manual operation.
+
+#### Contract
+
+SBR MUST prevent protected workload execution on a node after a reboot that followed a recorded SBR reboot decision, until the workloads of that node are evacuated through the API. The hold is local: maintaining it requires no API, network, or CSI after the reboot. The held node never becomes Ready, so the scheduler cannot place new workloads on it and kubelet cannot restart the node's former workloads in place.
+
+A changed kernel boot ID is evidence that the old boot ended. It is not the mechanism that maintains isolation. A stopped kubelet, a missing heartbeat, or an elapsed watchdog timeout is not proof of a completed reset. OutOfService force-detaches volumes, so peers may apply it only after validated hold evidence shows that no old writer can exist.
+
+The agent Pod remains the only watchdog opener, armer, and feeder. Host components never open, disarm, or feed the watchdog device.
+
+#### Boot hold mechanism
+
+The hold has two parts, installed together in one durable sequence:
+
+1. A journal fact: the `bootHold` record in `agent.extra`. It is a versioned JSON string with phase (`Required`), nodeUID, configUID, an unpredictable `incidentID`, `beforeBootID`, source, and `attemptID` when one exists. Autonomous attempts also bind `outageEpoch`. Generate the incidentID once and retain it across reporter restarts.
+2. A host enforcement: mask the systemd units that start protected workloads, kubelet first, plus the qualified VM autostart paths. Use atomic, durable operations: temporary symlink, `fsync`, rename, directory `fsync`. A mask stored under `/etc` survives reboot.
+
+The journal fact is the source of truth. The mask is its actuator. The reporter and the recovery procedures read the journal, never only the mask. If the journal records `Required` but the enforcement is absent, the node's protection is degraded: the reporter reports `ProtectionDegraded`, and peers must not treat the node as isolated.
+
+The commit sequence is ordered: persist the journal fact durably, install the enforcement, then invoke the reboot. A crash at any point is safe. Before the journal fact is durable, no reboot may start. After the journal fact is durable but before the enforcement is installed, the sequence is retried on agent restart. After the enforcement is installed, a watchdog reset produces a held boot. The enforcement does not stop a running kubelet; it prevents the next start. Masking before a software reboot therefore changes nothing for the running workloads, which the reboot itself terminates.
+
+A confirmed cancellation of an unaccepted request can clear an uncommitted hold only with matching identity, an unchanged boot, and no recorded reboot decision, under the executor lock, in the same transaction that removes the reservation.
+
+MachineConfig must not remove the mask. MCO rollouts cannot proceed on a held node because the machine-config-daemon runs as a Pod; this is expected and visible through the hold condition. Enrollment is explicit: the configuration controller and the agent verify that the host wiring, the maskable units, the installed reporter, and a valid identity descriptor are present before any remediation is permitted. Nodes without verified wiring or a valid descriptor are not remediation-eligible in BlockPerNode.
+
+#### Pre-recorded node identity
+
+All SBR host state lives under one root, `/var/lib/medik8s/state` (mode 0700, root:root), provisioned by MachineConfig with fixed SELinux labels rather than runtime Pod relabeling. It contains the journal (`sbr.json`), the identity descriptor (`identity.json`, mode 0600), and, where needed, materialized credentials (`pki/`, mode 0700).
+
+Node identity is resolved while the node is healthy and recorded for the held phase. The agent, running as a Pod with the host state mounted, resolves the node name from its Pod spec, reads the Node UID through its in-cluster access, resolves the API server endpoint and credentials from kubelet's own configuration chain, validates them, and writes the descriptor atomically. The descriptor records the node name, Node UID, the API server URL, and the resolved certificate, key, and CA paths in the host filesystem namespace. The recorded endpoint MUST be the host-routable endpoint used by the node kubeconfig, not any local proxy endpoint that kubelet itself uses: on some platforms kubelet talks through a local proxy whose static pod does not start under a held boot, while the direct endpoint stays reachable without CNI.
+
+For deployments whose kubelet kubeconfig carries inline certificate and key data, such as hosted control planes, the agent extracts and materializes the client certificate and key to `/var/lib/medik8s/state/pki/client.crt` and `client.key` with mode 0600, and re-syncs and re-validates them whenever the source kubeconfig changes. This is the only permitted copy of node credentials on the host: the kubelet client material is already host-local and stays within the same trust boundary; no service-account or administrator credential is ever copied.
+
+The descriptor is a convenience, not a trust anchor. Host root can forge it, but the node authorizer binds the client certificate to its own Node, so a forged descriptor cannot act on another node. The held-phase reporter validates the live Node UID against the recorded UID and halts reporting on mismatch. A node that reboots without a descriptor never attempts a boot-hold report; the reporter service is conditioned on the descriptor's existence.
+
+#### Host reporter
+
+One host service, installed through MachineConfig, runs independently of kubelet and the container runtime. It performs no discovery: it reads the pre-recorded identity descriptor, builds its client from the recorded paths, and reports. It uses the existing kubelet node certificate and configured CA to GET its own Node and to PATCH its own nodes/status only. It never patches the main Node resource, never sets Ready, never renews the kubelet Lease, and never accesses the watchdog.
+
+While the node is held, the reporter publishes an `SBRBootHeld` Node condition and re-publishes it periodically, so a condition removed or overwritten by another writer is restored on the next heartbeat. The condition is evidence, not authority. Its message is a bounded, versioned JSON payload:
+
+```json
+{
+  "version": 1,
+  "nodeUID": "node-uid",
+  "configUID": "config-uid",
+  "incidentID": "incident-uuid",
+  "source": "Autonomous",
+  "beforeBootID": "11111111-1111-4111-8111-111111111111",
+  "observedBootID": "22222222-2222-4222-8222-222222222222",
+  "holdState": "Required",
+  "protectionVersion": 1,
+  "neverAdmitted": true
+}
+```
+
+`neverAdmitted=true` means the reporter verified that this boot never started a protected workload. The reporter publishes only after the journal, the enforcement, and the current boot ID agree. Reject unknown payload versions, invalid types, mismatched identities, and messages over 8 KiB. Requested evidence additionally carries the requestUID and attemptID binding of Section 5.7.
+
+The reporter is a long-running service whose retry loop and bounded exponential backoff live inside the process, not in systemd restarts. It disables HTTP keep-alives and presents the client certificate through a per-handshake callback, so every heartbeat uses a fresh connection and the certificate currently on disk; no connection pool survives a credential change. It exits cleanly when the journal shows the hold cleared; the recovery transaction does not need to terminate it. No API access is required to keep the hold; reporting is best effort. Missing or expired node certificates keep the hold active and are reported through central alerts on stale telemetry and last-known certificate expiry. The kubelet binary is the only rotator of the node client certificate; while a node is held, kubelet is stopped, so the certificate only ages and expiry during a hold is an expected state. The manual recovery procedure does not depend on the reporter's certificate, and the hold is never bounded by certificate validity. Do not disable TLS verification, auto-approve CSRs, or copy privileged service-account credentials to the host.
+
+For requested BootEnded, the reporter preserves the ordering of Section 5.7: read the exact Accepted record, read the current local boot ID, then publish against that Node version; repeat after conflicts.
+
+#### Evacuation
+
+After API recovery, or immediately for requested remediation, the held incident is processed as follows:
+
+1. Validate the `SBRBootHeld` evidence: Node UID, incident binding, never-admitted boot, and the matching execution where one exists. Resolve `Accepted` to `BootEnded` only with the ordered evidence of Section 5.7.
+2. Apply OutOfService conditionally, only after this validation. Kubernetes, KubeVirt, and CSI controllers then perform standard force-deletion and detach. SBR does not directly delete workload Pods, VMIs, VolumeAttachments, PVCs, or PVs, and never strips their finalizers.
+3. Observe Pods, VMIs, and VolumeAttachments with complete live scans. The requested cleanup observation keeps its existing fixed deadline and truthful result. The boot hold itself has no fail-open timeout: a held node stays held until it is manually recovered, whatever the observation result.
+
+If no eligible peer is available, for example when every enrolled worker is held, the operator's evacuation routine applies OutOfService for held incidents using the same validation. It runs in the operator deployment, under the operator's existing leader election, and requires no peer Pod on the target.
+
+```mermaid
+sequenceDiagram
+  participant A as Target agent
+  participant H as Host service
+  participant N as Node status
+  participant P as Eligible peers / operator
+  participant K as Kubernetes controllers
+  A->>A: Persist bootHold=Required and mask units
+  A->>A: Software reboot with watchdog fallback
+  H->>H: Boot: journal and mask agree, nothing admitted
+  H->>N: Publish SBRBootHeld evidence
+  P->>N: Validate evidence, resolve BootEnded
+  P->>N: Apply OutOfService conditionally
+  K->>K: Process Pod deletion and volume detach
+  P->>K: Observe Pods, VMIs, and attachments
+  Note over P,N: Evacuation completes; node stays held
+  Admin->>H: Manual recovery (Section 5.11) or reprovision
+```
+
+The recovery placement rules apply. The operator, the API, admission, and the CSI controllers that process detach must run outside the enrolled worker set. Administrators declare these dependencies at installation. The operator validates its own placement and the declared dependencies, repeats these checks periodically, and exposes `RecoveryInfrastructureReady`. Loss of this prerequisite blocks new remediation and alerts; it never opens a hold. There is no universal CSIDriver-to-Deployment discovery: an incomplete declaration is an installation error, not evidence that no dependency exists.
+
+#### Manual recovery
+
+A held node is recovered by one of two supported procedures:
+
+1. Verified unblock. The administrator confirms that the storage incident is resolved and evacuation completed, gains host access through the supported console or SSH path, and runs the provided host recovery command. That command clears the journal fact and the enforcement together under the executor lock, records the recovery, and restarts or reboots the masked units. The node then re-registers and rejoins through normal Kubernetes startup.
+2. Reprovision. The administrator deletes the Node object and reprovisions the host. A fresh installation enrolls through the normal first-provisioning checks.
+
+Removing the mask without clearing the journal fact, or editing the journal directly, is not a supported recovery. SBR never strips workload finalizers; if evacuation is blocked by a foreign finalizer, restore the responsible controller or complete its documented obligation, then retry. Manual approval cannot bypass the isolation evidence requirement.
+
+Alerts expose hold age, the exact blocked evacuation prerequisite with bounded object references, reporter health, and certificate expiry evaluated against the last observed telemetry. Indefinite hold is an explicit availability cost when evidence cannot be obtained.
+
+#### Watchdog and held nodes
+
+After a committed reboot, no component feeds the watchdog while the node is held. A platform that keeps the watchdog armed across a host reset can reset a held node repeatedly. This is not a safety failure: a held node runs no workloads, and after evacuation it holds no volume attachments. It is an operational fault. Alert on repeated boot-ID churn under one incident and recover the node through reprovision.
+
+Qualification must still establish that each supported reset path resets a hung node, and that the watchdog does not fire during normal agent operation. The agent remains the only watchdog owner; no host feeding or handoff fallback is provided.
+
+#### Future extension: controlled rejoin
+
+A future release may add controlled automatic rejoin on top of the same hold state: a boot admission state machine with a clean-shutdown protocol, a rejoin controller in the operator, and a boot-bound release authorization enforced by admission policy. This release keeps the seams for that extension:
+
+- The journal `bootHold` record and the `SBRBootHeld` payload are versioned and carry incident identity from day one.
+- The mask is the actuator of the journal fact, not the source of truth, so a future boot gate can enforce the same fact.
+- The future migration translates a present mask and `Required` hold into the extended state machine before the future gate activates. A fresh installation enrolls directly.
+
+The alternative full design is documented in the companion proposal "Default-deny boot protection and controlled rejoin".
 
 ## 6. Open Questions
 
@@ -1118,15 +1252,13 @@ The CSI-independent reporter can observe the boot identified by beforeBootID end
 
 A healthy peer cannot manufacture target boot evidence. The accepted request can retain its finalizer and prevent a later request until a peer establishes BootEnded. Cleanup timeout does not resolve it. NHC can also exclude that node from its healthy count while a remediation CR remains.
 
-### 6.2. Accepted risks: OutOfService and scheduling restoration
+### 6.2. Isolation, evacuation, and manual recovery
 
-The design retains current SBR's OutOfService and rejoin risks. Current SBR uses shared-heartbeat cessation for fencing completion. BlockPerNode requires `BootEnded`, but still does not prove continuing isolation. A rebooted host can restart workloads before the taint arrives. Kubernetes force deletion or detach can then overlap workload writes and cause duplicate writers or data corruption.
+The durable boot hold prevents workload execution after an SBR-committed reboot until evacuation completes. It does not hold unclean boots without a recorded SBR decision; that residual window is recorded in Section 6.10. It does not prove physical storage revocation. Crash recovery remains the responsibility of the configured storage stack under its documented crash-recovery contract; an empty attachment list is control-plane recovery evidence, never physical-detach proof.
 
-Neither a changed boot ID nor the five-minute observation limit proves continuing isolation. The design deliberately adds no external fence or early-boot workload hold. `FencingSucceeded=True` is the provider's terminal policy result, not a guarantee of continuing isolation.
+A held node requires manual recovery. Every remediation removes the node from service until an administrator acts or the node is reprovisioned. This availability cost is deliberate: the alternative is a node that races back to Ready against the control plane's taints.
 
-During remediation CR deletion, the peer removes SBR’s restrictions when the restrictions list becomes empty, even if cleanup is incomplete or unknown. Pending controller actions can continue after taint removal. The design accepts this rejoin risk and does not require a separate safety approval.
-
-These risks must appear in user documentation and release qualification. Tests must not assert guarantees that this policy does not provide.
+During remediation CR deletion, the peer removes SBR’s restrictions when the restrictions list becomes empty and evacuation permits it. Pending controller actions can continue after taint removal. These limitations must appear in user documentation and release qualification. Tests must not assert guarantees that this policy does not provide.
 
 ### 6.3. Accepted limitation: cleanup during API loss
 
@@ -1170,7 +1302,7 @@ At least one peer that meets Section 5.2 requirements must remain running with A
 
 CSI attachment failure can prevent replacement peer Pods from starting. A shared outage or rollout can therefore remove every controller that meets Section 5.2 requirements. A single selected node has no peer for its own request.
 
-Without a peer, SBR must wait to record Offered, Cancelled, or BootEnded, or to remove the remediation CR’s finalizer. The target and reporter retain their limited roles. On return, a peer resumes the same execution record and cleanup deadline.
+Without a peer, SBR must wait to record Offered, Cancelled, or BootEnded, or to remove the remediation CR’s finalizer. The target and the host reporter retain their limited roles. For a held incident, the operator evacuation routine in Section 5.11 can validate evidence and apply OutOfService without a peer on the target. On return, a peer resumes the same execution record and cleanup deadline.
 
 ### 6.9. Remaining qualification questions
 
@@ -1180,17 +1312,27 @@ Without a peer, SBR must wait to record Offered, Cancelled, or BootEnded, or to 
 - Which watchdog and RHCOS versions satisfy the nowayout, process-exit, and verified-disarm contract?
 - Which KubeVirt and CSI versions exhibit the expected OutOfService behavior?
 - Can complete API scans finish within the supported node density and request deadlines?
-- Do agent and reporter tolerations preserve their required resources during termination and rolling updates?
+- Do agent tolerations and host-reporter lifecycle management preserve coverage during termination and rolling updates?
 - Which recovery procedure establishes missing history without granting permission for another autonomous reboot?
 - How many CRs should the supported policy allow in the restrictions list?
 
 The design does not guarantee that a replacement VM or Pod starts successfully. Cleanup observations and replacement workload availability remain different results.
 
+### 6.10. Accepted limitations of the boot hold
+
+Unclean boots without a recorded SBR decision are not held. A node that crashes during a storage incident restarts its workloads in place until NHC triggers a new remediation cycle, which then commits a reboot and fences the node properly. SBR applies OutOfService only after a committed reboot, so force-detach never overlaps an old writer on an SBR-initiated path; the residual exposure is workloads running on unhealthy storage, not duplicate writers. An administrator can apply the standard manual OutOfService procedure at any time, as in plain Kubernetes.
+
+Node recovery is manual. Every remediation removes the node from service until an administrator runs the recovery command or reprovisions the host. Size `minHealthy` and operational capacity accordingly.
+
+There is no durable local inhibit for autonomous reboots in this release. Detect-only mode requires the API, so it cannot stop an autonomous reboot that has already become eligible during an API outage. The future controlled-rejoin extension includes the inhibit handshake.
+
+The mask-and-MCO interaction, the VM autostart paths beyond kubelet-managed pods, and the watchdog reset behavior of each supported platform require qualification before enrollment.
+
 ## 7. Upgrade / Downgrade Concerns
 
 An upgrade preserves omitted volume mode as `Filesystem`. Omitted `ioTimeout` retains two seconds in existing modes and selects fifteen seconds in BlockPerNode. Existing modes retain their counter and retry behavior. Explicit timeout overrides change their per-operation wait value. Only BlockPerNode selects failed-state evaluations and a complete probe deadline. Total-outage grace and autonomous recovery remain optional BlockPerNode fields.
 
-Install compatible CRDs, webhooks, operator, agent, and reporter images before enabling BlockPerNode. Pin a common release that implements the nodestate contract. The feature is unavailable with common v1.17.0.
+Install and qualify the host reporter and the maskable unit wiring, plus compatible CRDs, webhooks, operator, and agent images, before enabling BlockPerNode. The journal ships the complete five-key state including `bootHold` from the first BlockPerNode release; there is no four-key predecessor to migrate. An unknown state version must fail closed rather than infer the absence of a hold. Pin a common release that implements the nodestate contract. The feature is unavailable with common v1.17.0.
 
 All components must understand the Node record version, execution phases, boot observations, set of listed CRs, and budget accounting. Never send BlockPerNode arguments to an older agent. Unknown mode and record versions must block execution rather than select a shared-storage path.
 
@@ -1288,8 +1430,8 @@ Use envtest for races between peers recording Offered and processing remediation
 - Delay unschedulable taint removal after the final listed CR leaves. Permit finalizer removal after the required release update succeeds. Repeat with an administrator cordoning the Node before the retry. Preserve that cordon without waiting for the taint to disappear.
 - After a peer’s Offered update conflicts, change the remediation CR’s deletion state, NHC stop state, or terminal state, or replace its UID. After reading the Node, read the CR without the cache and repeat the checks for entering Offered. Never reuse cached checks with a new Node version.
 - Replace the Node before a release retry. Reject the old binding without changing the replacement. Check CR UID and resource version during finalizer removal.
-- Require accepted `BootEnded` evidence before requested OutOfService processing. Do not require a separate isolation attestation.
-- Confirm that agents and reporters tolerate the OutOfService taint. Observe workload removal through Kubernetes controllers.
+- Require accepted `BootEnded` evidence and separately validated hold evidence before requested OutOfService processing. Reject observations without a matching incident or never-admitted boot.
+- Confirm that agent Pods tolerate the OutOfService taint and that the host reporter remains independent of Pod eviction. Observe workload removal through Kubernetes controllers.
 - Assert that SBR never directly deletes Pods, VMIs, VolumeAttachments, PVCs, or PVs. The BlockPerNode cleanup path must not require Pod-delete permission.
 - Persist the internal five-minute deadline before the first OutOfService attempt. Preserve it across conflicts, peer replacement, and process restart.
 - Inject OutOfService update failures and lost API responses. Resolve uncertain writes through live reads. Deadline expiry must not imply successful taint application.
@@ -1320,7 +1462,7 @@ Keep one running peer's probe I/O blocked while it reconciles another target. Se
 
 Test Pod and PVC replacement while preserving host state. Test requested host reboot, NHC remediation timeout, remediation CR deletion, SBR config CR replacement, and operator restart. Verify that incomplete Pod, VMI, or attachment observations do not prevent the specified completion and deletion behavior.
 
-Start workloads after reboot before OutOfService processing. Record the resulting behavior without claiming that SBR establishes continuing isolation. These tests demonstrate the accepted risk, not a prevention guarantee.
+Attempt to start workloads after an SBR-committed reboot before OutOfService processing. Assert that the boot hold prevents execution and that the node never becomes Ready. Any such execution is a qualification failure. Separately, document the behavior of an unclean boot without an SBR decision: workloads restart in place, as recorded in Section 6.10, and the next remediation cycle fences the node.
 
 Scenarios 13 and 14 remain deferred. Scenario 17 includes requested execution ordering, autonomous reboot counts and limits, history uncertainty, and exclusion of a second local agent. A power-loss test must not expect the watchdog to restore power.
 
@@ -1347,6 +1489,20 @@ The current reboot watcher waits for `FencingSucceeded` before restarting a Kind
 
 Kind shares the host kernel. Its null watchdog cannot qualify hardware watchdog behavior. Keep production checks enabled. Run real-host, CSI, and KubeVirt qualification separately from these simulations.
 
+### 8.7. Boot hold and evacuation qualification
+
+Use deterministic transition tests, envtest for real resourceVersion conflicts, and real-host OpenShift qualification for systemd and mask behavior.
+
+- Commit-sequence crash injection: crash after the journal fact, after the enforcement, and before the reboot. The reboot starts only after both parts are durable. A watchdog reset after the enforcement produces a held boot.
+- Held boot: kubelet and VM autostart paths do not start; the node never becomes Ready; the scheduler places nothing; former workloads do not restart in place.
+- Reporter: publishes `SBRBootHeld` with correct bindings only when the journal, the enforcement, and the current boot ID agree; no main-resource patching; never sets Ready; retries on API loss with monotonic backoff; certificate expiry keeps the hold and raises central alerts on stale telemetry.
+- Evacuation ordering: OutOfService is applied only after validated evidence, by peers and by the operator routine using the same validation. Force-detach never overlaps a live writer on an SBR-initiated path.
+- Fleet case: hold every enrolled worker simultaneously; the operator evacuation routine applies OutOfService for all incidents; loss of the operator or required CSI controllers keeps the holds and exposes the dependency.
+- Foreign finalizers: evacuation reports the exact blocked objects with bounded references; the hold remains; recovery follows the runbook, never blanket finalizer removal.
+- Manual recovery: the host command clears the journal fact and the enforcement together under the executor lock; partial or unsupported recovery is detected and reported; reprovision enrolls cleanly.
+- MCO interaction: rollouts cannot proceed on a held node; MachineConfig does not remove the mask; a mask present without a journal fact reports `ProtectionDegraded`.
+- Watchdog churn: repeated boot-ID resets under one incident alert as an operational fault and never start workloads.
+
 ## Alternatives considered
 
 - Run the BlockPerNode lifecycle controller in the elected operator manager or a separate Pod without a probe volume. This removes the probe-volume startup dependency from lifecycle reconciliation. The selected design reuses the existing agent controller and accepts the peer availability requirement in Section 6.8.
@@ -1355,7 +1511,7 @@ Kind shares the host kernel. Its null watchdog cannot qualify hardware watchdog 
 - Chain NHC, SNR, and SBR. This reuses SNR reboot and cleanup behavior, but divides one remediation across two providers. The providers must also coordinate watchdog control, boot information, and responsibility for cleanup.
 - Trigger remediation from the Node `Ready` condition or make out-of-band fencing the primary path. `Ready` would allow an API or network failure with healthy storage to disrupt a VM. Out-of-band fencing is useful where available, but is not present in every target environment and remains a separately qualified isolation mechanism.
 
-This design was selected because it keeps one remediation provider and one component permitted to perform local actions. It replaces the shared probe with a private per-node Block volume. It is the smallest extension that preserves existing shared-storage behavior and keeps storage health separate from API or network health.
+This design was selected because it keeps one remediation provider and one component permitted to perform local actions. It replaces the shared probe with a private per-node Block volume. It preserves existing shared-storage behavior and keeps storage health separate from API or network health. The boot hold of Section 5.11 is a deliberate host integration, not a minimal change: it trades automatic node recovery for a locally enforced guarantee that a remediated node cannot run workloads until they are evacuated. A design with full automatic controlled rejoin was also considered; it is documented as the companion proposal and kept as a future extension on top of the same hold state.
 
 ## Terminology
 
@@ -1365,7 +1521,7 @@ A **remediation CR** is a `StorageBasedRemediation` resource. An **SBR config CR
 |---|---|
 | Local agent | The part that checks storage, controls the watchdog, reboots its host, and writes the journal. |
 | Peer controller | The API controller in an agent that processes requests for other nodes. |
-| Reporter | This separate component reads host boot information in the order required by Section 5.7. It publishes observations without using the probe. |
+| Reporter | The host reporter service publishes ordered boot and hold observations without kubelet or the probe. It never feeds the watchdog and never releases a hold. |
 | Probe | This private Block volume contains disposable test data. |
 | Journal | This durable host file records attempts and autonomous reboot counts. |
 | Request identity | The CR UID identifies a request. Its Node UID and initial boot ID cannot change. |
@@ -1379,9 +1535,13 @@ A **remediation CR** is a `StorageBasedRemediation` resource. An **SBR config CR
 | Listed CR | This CR has an entry in the Node record’s holders field because it still requires SBR’s scheduling restrictions. The entry is separate from execution ownership. |
 | Restriction snapshot | This records the cordon and OutOfService state before SBR added the first CR to the current restrictions list. |
 | Cleanup observation | A peer checks relevant Pods, VMIs, and VolumeAttachments through the API after reboot, within a fixed period. |
-| Rejoin | During remediation CR deletion, a peer removes SBR’s scheduling restrictions. This does not guarantee complete cleanup or that workloads remain isolated. |
+| Rejoin | Returning a held node to service. In this release rejoin is manual: a verified unblock or a reprovision. Automatic controlled rejoin is a future extension. |
+| Boot hold | Durable journal fact plus host enforcement that prevents protected workload execution after an SBR-committed reboot until evacuation and manual recovery. |
+| Incident / incidentID | One held episode bound to a reboot decision; an unpredictable identifier retained across reporter restarts. |
+| SBRBootHeld | Node condition, published by the host reporter, carrying validated current-boot hold evidence. |
+| Budget | Permission for one autonomous attempt per unresolved outage; requested attempts do not consume it. |
 | Autonomous reboot count and limit | SBR records autonomous attempts and their limit per node. A new CR, process, or configuration cannot reset these records. Requested reboots have no such limit. |
 | Outage period | After an autonomous attempt, no further autonomous attempt is permitted until storage and API health satisfy the configured recovery period. |
 | Rearm | SBR permits another autonomous reboot after the configured recovery period and required history checks. The recovery period defaults to five minutes. |
 
-Recording Offered, accepting the request, recording the local reboot decision, establishing BootEnded, and checking cleanup are separate steps. The policy can finish while cleanup remains incomplete. Neither success conditions nor elapsed time prove that workloads remain isolated.
+Recording Offered, accepting the request, recording the local reboot decision and boot hold, establishing BootEnded, validating hold evidence, and completing evacuation are separate steps. Bounded processing can finish while cleanup remains incomplete; the boot hold remains until evacuation completes and the node is manually recovered.
