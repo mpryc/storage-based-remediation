@@ -484,9 +484,9 @@ When a replacement agent Pod gets a new PVC, remove the old watcher assignment. 
 
 ##### Order agent and watcher condition updates
 
-The local agent and watcher share one Node annotation to order updates to `SBRStorageUnhealthy`. Save the Node UID, configuration UID, agent Pod UID, PVC UID, writer boot ID, and producer incarnation with each observation. A producer incarnation identifies one writer process. Check the new writer's identity before using its observations. The watcher also checks the assignment generation and observation revision. Recovery also requires a new successful probe result.
+The local agent and the watcher share the `sbr.medik8s.io/heartbeat-ordering` annotation to order updates to `SBRStorageUnhealthy`. Both may write it. Save the Node UID, configuration UID, agent Pod UID, PVC UID, writer boot ID, and producer incarnation with each observation. A producer incarnation identifies one writer process. Check the new writer's identity before using its observations. The watcher also checks the assignment generation and observation revision. Recovery also requires a new successful probe result.
 
-Update the condition, failure revision, and probe sequence in one conditional `nodes/status` update. Keep the revision and sequence in the ordering annotation. Check the live Node UID and `resourceVersion`. Preserve unrelated fields.
+Update the condition, failure revision, and probe sequence in one conditional `nodes/status` update. Keep the revision and sequence in the `sbr.medik8s.io/heartbeat-ordering` annotation. Check the live Node UID and `resourceVersion`. Preserve unrelated fields.
 
 On conflict, read the live Node and check the observation again. If the relevant revision changed, repeat the probe or watcher read as applicable. See [Kubernetes Node status update strategy](https://github.com/kubernetes/kubernetes/blob/v1.35.0/pkg/registry/core/node/strategy.go#L149-L174).
 
@@ -548,7 +548,7 @@ If the API remains unavailable, the agent then waits sixty seconds under the def
 
 The agent and watcher update the same `SBRStorageUnhealthy` condition under Section 5.5. Watcher results leave the target's local failure count and autonomous reboot checks unchanged. NHC can create a remediation CR if the condition satisfies its policy.
 
-Use the ordering annotation and conditional `nodes/status` update from Section 5.5. Preserve unrelated Node fields. Keep `LastTransitionTime` if the condition status stays the same. Combine duplicate writes. Limit the delay before writing a change to `SBRStorageUnhealthy=True`. NHC then applies its separate condition duration.
+Use the `sbr.medik8s.io/heartbeat-ordering` annotation and conditional `nodes/status` update from Section 5.5. Preserve unrelated Node fields. Keep `LastTransitionTime` if the condition status stays the same. Combine duplicate writes. Limit the delay before writing a change to `SBRStorageUnhealthy=True`. NHC then applies its separate condition duration.
 
 When the target observes detect-only mode, it stops trying to accept new offers. It cannot choose to reboot because the acceptance result is unknown or because both storage and API are unavailable. Peers stop publishing new offers. The target can continue a confirmed `Accepted` request for this boot until it sees a newer offer replace it. The target continues any reboot it already chose.
 
@@ -1438,7 +1438,7 @@ Use envtest to race a peer's conditional Offered update against CR deletion. Che
 - Retry an older Expired report after probe 42 fails. Check that the failure revision and sequence boundary stay the same. Check that retrying an expired sample does not update its timestamp.
 - Start or restart the watcher after the target reports a failure. Check that the watcher reads the current failure revision and collects a fresh baseline before reporting recovery.
 - Publish a fresh completion that follows the current failure. Check that the agent or watcher can set `SBRStorageUnhealthy=False` after it checks the producer identity, failure revision, and sequence under Section 5.5.
-- Use a live API server to check that one conditional `nodes/status` update sets the condition and its ordering annotation. Race the update with kubelet status and unrelated annotation updates. Check that unrelated values survive retries.
+- Use a live API server to check that one conditional `nodes/status` update sets the condition and its `sbr.medik8s.io/heartbeat-ordering` annotation. Race the update with kubelet status and unrelated annotation updates. Check that unrelated values survive retries.
 - Check that a watcher cannot add OutOfService. Set NHC thresholds that prevent it from creating a CR. Check that an autonomous reboot alone does not create a CR.
 - Publish a delayed autonomous report after CR deletion, NHC stop, or supersession. Check that it does not create a CR, set the storage condition from stale data, start a reboot grace period, or permit a taint update.
 - Make fresh local storage and API checks permit autonomous reboots on several nodes. Check that the agents apply no cluster-wide limit. When a node's history shows it already used its attempt for that outage, check that the local agent does not reboot it again.
